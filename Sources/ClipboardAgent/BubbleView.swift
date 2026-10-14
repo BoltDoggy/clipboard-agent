@@ -1,8 +1,11 @@
 import SwiftUI
 
-/// 气泡尺寸统一出处：NSPanel 与 SwiftUI 根视图共用。
+/// 气泡尺寸统一出处。宽度固定；高度自适应内容（NSHostingController 的
+/// preferredContentSize 驱动窗口），clamp 在 [minHeight, 屏幕可用高度]。
 enum BubbleMetrics {
-    static let size = NSSize(width: 380, height: 480)
+    static let width: CGFloat = 380
+    static let minHeight: CGFloat = 240
+    static let maxHeight: CGFloat = 1600 // 纯保险值；实际约束是屏幕可用高度
     static let cornerRadius: CGFloat = 18
 }
 
@@ -28,18 +31,31 @@ final class BubbleModel: ObservableObject {
     @Published var fastSlot: ReplyState = .pending
     @Published var deepSlot: DeepSlot = .off
 
+    /// 深度模型的意图分析与推荐操作（从 <<ACTIONS>> 块解析）。
+    @Published var intentSummary: String?
+    @Published var recommendedActions: [RecommendedAction] = []
+
+    /// 深度回复的原始累积（含 <<ACTIONS>> 标记块；展示时剥离）。
+    private var deepRawContent = ""
+
     func begin(copied: String, fastName: String, deepName: String?) {
         self.fastName = fastName
         self.deepName = deepName
         copiedText = copied
         fastSlot = .pending
         deepSlot = deepName == nil ? .off : .active(.pending)
+        deepRawContent = ""
+        intentSummary = nil
+        recommendedActions = []
     }
 
     func reset() {
         copiedText = nil
         fastSlot = .pending
         deepSlot = .off
+        deepRawContent = ""
+        intentSummary = nil
+        recommendedActions = []
     }
 
     // 流式增量写入（在 MainActor 上由 runAgent 的桥回调触发）
@@ -50,7 +66,82 @@ final class BubbleModel: ObservableObject {
 
     func appendDeep(_ event: StreamEvent) {
         guard case .active(let state) = deepSlot else { return }
+        // 深度正文先累积原始串（含 <<ACTIONS>> 块），展示时剥离并解析意图/操作
+        if !event.contentText.isEmpty {
+            deepRawContent += event.contentText
+            let parsed = Self.splitActions(deepRawContent)
+            applyParsedActions(parsed)
+            deepSlot = .active(.streaming(
+                reasoning: reasoningText(of: state) + event.reasoningText,
+                steps: stepList(of: state) + (event.stepText.map { [$0] } ?? []),
+                content: parsed.visible
+            ))
+            return
+        }
         deepSlot = .active(Self.appended(event, to: state))
+    }
+
+    func finishDeep(_ outcome: AgentOutcome) {
+        guard case .active = deepSlot else { return }
+        if case .ok(let raw) = outcome {
+            let parsed = Self.splitActions(raw)
+            applyParsedActions(parsed)
+            let corrected = AgentOutcome.ok(parsed.visible)
+            deepSlot = .active(.finished(corrected, reasoning: Self.reasoningOf(deepSlotState), steps: Self.stepsOf(deepSlotState)))
+            return
+        }
+        deepSlot = .active(.finished(outcome, reasoning: Self.reasoningOf(deepSlotState), steps: Self.stepsOf(deepSlotState)))
+    }
+
+    private var deepSlotState: ReplyState {
+        if case .active(let s) = deepSlot { return s }
+        return .pending
+    }
+
+    private func reasoningText(of state: ReplyState) -> String {
+        if case .streaming(let r, _, _) = state { return r }
+        return ""
+    }
+
+    private func stepList(of state: ReplyState) -> [String] {
+        if case .streaming(_, let s, _) = state { return s }
+        return []
+    }
+
+    private func applyParsedActions(_ parsed: (visible: String, intent: String?, actions: [RecommendedAction])) {
+        if let intent = parsed.intent, !intent.isEmpty { intentSummary = intent }
+        if !parsed.actions.isEmpty { recommendedActions = parsed.actions }
+    }
+
+    /// 把含 <<ACTIONS>>…<<END>> 标记块的原始输出拆成：可见正文 + 意图 + 推荐操作。
+    /// 流式期间块未闭合时，标记起的内容一律不进入可见正文。
+    static func splitActions(_ raw: String) -> (visible: String, intent: String?, actions: [RecommendedAction]) {
+        guard let start = raw.range(of: "<<ACTIONS>>") else {
+            return (raw.trimmingCharacters(in: .whitespacesAndNewlines), nil, [])
+        }
+        let visible = String(raw[raw.startIndex..<start.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let after = raw[start.upperBound...]
+        let payload: String
+        if let end = after.range(of: "<<END>>") {
+            payload = String(after[after.startIndex..<end.lowerBound])
+        } else {
+            payload = String(after) // 块还在流式中，只解析已到达的部分
+        }
+
+        guard let data = payload.trimmingCharacters(in: .whitespacesAndNewlines).data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return (visible, nil, [])
+        }
+        let intent = obj["intent"] as? String
+        var actions: [RecommendedAction] = []
+        for item in (obj["actions"] as? [[String: Any]] ?? []).prefix(3) {
+            guard let label = item["label"] as? String,
+                  let type = item["type"] as? String,
+                  let arg = item["arg"] as? String else { continue }
+            actions.append(RecommendedAction(label: label, type: type.lowercased(), arg: arg))
+        }
+        return (visible, intent, actions)
     }
 
     private static func appended(_ event: StreamEvent, to state: ReplyState) -> ReplyState {
@@ -74,11 +165,6 @@ final class BubbleModel: ObservableObject {
 
     func finishFast(_ outcome: AgentOutcome) {
         fastSlot = .finished(outcome, reasoning: Self.reasoningOf(fastSlot), steps: Self.stepsOf(fastSlot))
-    }
-
-    func finishDeep(_ outcome: AgentOutcome) {
-        guard case .active(let state) = deepSlot else { return }
-        deepSlot = .active(.finished(outcome, reasoning: Self.reasoningOf(state), steps: Self.stepsOf(state)))
     }
 
     private static func reasoningOf(_ state: ReplyState) -> String {
@@ -126,6 +212,7 @@ struct BubbleView: View {
     @ObservedObject var model: BubbleModel
     var onCopyReply: (String) -> Void
     var onClose: () -> Void
+    var onAction: (RecommendedAction) -> Void = { _ in }
 
     @State private var appeared = false
 
@@ -140,11 +227,22 @@ struct BubbleView: View {
             fastSection
             deepSection
 
-            Spacer(minLength: 0)
+            if model.intentSummary != nil || !model.recommendedActions.isEmpty {
+                actionsBar
+            }
+
             footer
         }
         .padding(16)
-        .frame(width: BubbleMetrics.size.width, height: BubbleMetrics.size.height)
+        // 实心底色：92% 不透明度的窗口底色压在毛玻璃之上，只留极轻材质质感——
+        // 单靠 popover 材质依然偏透，背景复杂时文字受干扰
+        .background(
+            RoundedRectangle(cornerRadius: BubbleMetrics.cornerRadius, style: .continuous)
+                .fill(Color(nsColor: .windowBackgroundColor).opacity(0.92))
+        )
+        // 宽度固定、高度完全交给自然内容：preferredContentSize 可能很大，
+        // 由控制器把窗口 clamp 到屏幕可用高度——窗口受限后内层 ScrollView 自动压缩滚动
+        .frame(width: BubbleMetrics.width, alignment: .top)
         .overlay(
             RoundedRectangle(cornerRadius: BubbleMetrics.cornerRadius, style: .continuous)
                 .strokeBorder(.white.opacity(0.15), lineWidth: 1)
@@ -241,6 +339,9 @@ struct BubbleView: View {
         section(badge: "⚡", name: model.fastName) {
             replyBody(model.fastSlot, small: false)
         }
+        // 快速段高度只取内容自然值：不随深度段的增长被贪婪拉伸/压缩，
+        // 空间协商全部交给深度段（唯一负责吸收增长的区域）
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     // MARK: - 🧠 深度思考段
@@ -289,13 +390,14 @@ struct BubbleView: View {
         case .streaming(let reasoning, let steps, let content):
             VStack(alignment: .leading, spacing: 6) {
                 if !reasoning.isEmpty {
-                    reasoningBlock(reasoning, live: content.isEmpty && steps.isEmpty, maxHeight: small ? 54 : 40)
+                    reasoningBlock(reasoning, live: content.isEmpty && steps.isEmpty, maxHeight: small ? 64 : 48)
                 }
                 if !steps.isEmpty {
                     stepsBlock(steps)
                 }
                 if !content.isEmpty {
-                    StreamingText(text: content, fontSize: small ? 11.5 : 12, maxHeight: small ? 74 : 60)
+                    // 上限给很大值：正常内容自然顶开气泡，极端超长交给窗口 clamp 后滚动
+                    StreamingText(text: content, fontSize: small ? 11.5 : 12, maxHeight: small ? 4000 : 120)
                 }
             }
         case .finished(let outcome, let reasoning, let steps):
@@ -303,7 +405,7 @@ struct BubbleView: View {
             case .ok(let reply):
                 VStack(alignment: .leading, spacing: 6) {
                     if !reasoning.isEmpty {
-                        reasoningBlock(reasoning, live: false, maxHeight: small ? 54 : 40)
+                        reasoningBlock(reasoning, live: false, maxHeight: small ? 64 : 48)
                     }
                     if !steps.isEmpty {
                         stepsBlock(steps)
@@ -315,7 +417,7 @@ struct BubbleView: View {
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(maxHeight: small ? 74 : 60)
+                    .frame(maxHeight: small ? 4000 : 120)
                 }
             case .failed(let message):
                 Text(message)
@@ -369,6 +471,44 @@ struct BubbleView: View {
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .fill(.quaternary.opacity(0.5))
         )
+        .fixedSize(horizontal: false, vertical: true) // 思考块同样不参与空间协商
+    }
+
+    /// 意图分析 + 推荐操作条（深度模型 <<ACTIONS>> 块解析而来）。
+    private var actionsBar: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            if let intent = model.intentSummary {
+                Text("🎯 \(intent)")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            if !model.recommendedActions.isEmpty {
+                HStack(spacing: 8) {
+                    ForEach(Array(model.recommendedActions.enumerated()), id: \.offset) { _, action in
+                        Button {
+                            onAction(action)
+                        } label: {
+                            Label(action.label, systemImage: iconName(for: action.type))
+                                .font(.system(size: 11))
+                        }
+                        .controlSize(.small)
+                        .buttonStyle(.bordered)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true) // 不参与空间协商
+    }
+
+    private func iconName(for type: String) -> String {
+        switch type {
+        case "search": return "magnifyingglass"
+        case "open_url": return "safari"
+        case "copy": return "doc.on.doc"
+        default: return "arrow.right.circle"
+        }
     }
 
     // MARK: - 底部操作

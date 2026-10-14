@@ -144,9 +144,11 @@ final class AppSettings: ObservableObject {
                 : SimulatedAgent()
             let thinkingAgent: (any AgentService)?
             if config.enableThinking && config.thinking.isConfigured {
+                // 深度模型统一附加“意图分析 + 操作推荐”指令
+                let deepPrompt = config.systemPrompt + "\n\n" + DeepBehavior.intentHint
                 let base = OpenAICompatibleAgent(
                     endpoint: config.thinking,
-                    systemPrompt: config.systemPrompt,
+                    systemPrompt: deepPrompt,
                     role: .deep,
                     effort: config.thinkingEffort,
                     timeout: 30

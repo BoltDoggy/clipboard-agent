@@ -67,6 +67,28 @@ func runAgent(
     }
 }
 
+/// 深度模型的行为指令：意图分析 + 操作推荐。
+/// 模型在正文之后输出 <<ACTIONS>> 结构化块，应用解析为可点击操作。
+enum DeepBehavior {
+    static let intentHint = """
+    完成正文回答后，请分析用户复制这段文本的可能意图，并在最后严格按以下格式附加操作推荐 \
+    （此块内容不会展示给用户，会被解析成按钮）：
+    <<ACTIONS>>
+    {"intent":"一句话概括用户意图","actions":[{"label":"按钮文案（≤6字）","type":"操作类型","arg":"参数"}]}
+    <<END>>
+    操作类型只能是这三种：search（arg 为搜索词，跳转搜索引擎）、open_url（arg 为完整 URL，\
+    打开网页）、copy（arg 为要写入剪贴板的文本，如翻译结果/摘要/润色稿）。\
+    actions 最多 3 个、按可能有用程度排序；没有值得推荐的给空数组。不要输出此块以外的任何标记。
+    """
+}
+
+/// 深度模型推荐的一个操作（由 <<ACTIONS>> 块解析而来）。
+struct RecommendedAction: Equatable {
+    let label: String
+    let type: String // search / open_url / copy
+    let arg: String
+}
+
 /// 把一段文本切成小块，供离线演示的打字机效果使用。
 private func typingChunks(_ text: String, size: Int = 3) -> [String] {
     var chunks: [String] = []
@@ -169,6 +191,15 @@ struct SimulatedDeepAgent: AgentService {
         深度分析（演示）：这段文本共 \(chars) 字符 / \(words) 词 / 约 \(max(sentences, 1)) 句，\(language)。\
         真实深度模型会在这里给出结构化结论：主题概括、要点提取、潜在风险或可执行建议。\
         在「模型配置」中为快速/深度两个阶段分别填入 API 地址与模型名即可体验真实级联。
+        <<ACTIONS>>
+        {"intent":"想了解这段文本的含义并深入处理","actions":[{"label":"搜索相关资料","type":"search","arg":"\(previewKeyword(text))"},{"label":"复制全文摘要","type":"copy","arg":"摘要（演示）：\(language)文本，\(chars) 字符，约 \(max(sentences, 1)) 句。"}]}
+        <<END>>
         """
+    }
+
+    /// 离线演示的搜索词：取前几个非空白字符。
+    private static func previewKeyword(_ text: String) -> String {
+        let cleaned = text.replacingOccurrences(of: "\n", with: " ")
+        return String(cleaned.prefix(12))
     }
 }

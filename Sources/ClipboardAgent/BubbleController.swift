@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 /// 无边框、非激活的悬浮面板：可点击但不抢焦点，显示在所有空间之上。
@@ -32,7 +33,7 @@ final class BubblePanel: NSPanel {
     override func mouseExited(with event: NSEvent) { onMouseHover?(false) }
 }
 
-/// 气泡的生命周期管理：显示 / 级联编排（⚡快速 → 🧠深度）/ 自动关闭。
+/// 气泡的生命周期管理：显示 / 级联编排（⚡快速 → 🧠深度）/ 自适应高度 / 自动关闭。
 @MainActor
 final class BubbleController {
     private let model = BubbleModel()
@@ -40,6 +41,13 @@ final class BubbleController {
     private var replyTask: Task<Void, Never>?
     private var dismissTask: Task<Void, Never>?
     private var isHovering = false // 鼠标悬停在气泡上时暂停自动关闭
+
+    // 高度自适应：离屏测量副本（不进窗口层级，preferredContentSize 不受显示视口影响，
+    // 否则会随当前窗口尺寸“自锁”）；model 变化节流后测量并调整窗口
+    private var hostController: NSHostingController<BubbleView>!
+    private var measuringController: NSHostingController<BubbleView>!
+    private var modelSink: AnyCancellable?
+    private var measureTask: Task<Void, Never>?
 
     /// 每次触发时取当前生效的级联组合（由 AppDelegate 注入，随配置切换）。
     var agentProvider: () -> AgentPair = { AgentPair(fast: SimulatedAgent(), thinking: nil) }
@@ -50,41 +58,48 @@ final class BubbleController {
     private let margin: CGFloat = 18
 
     init() {
+        hostController = NSHostingController(rootView: BubbleView(
+            model: model,
+            onCopyReply: { [weak self] reply in self?.copyReply(reply) },
+            onClose: { [weak self] in self?.dismissNow() },
+            onAction: { [weak self] action in self?.performAction(action) }
+        ))
+        // 离屏测量副本：共享同一个 model，视图结构相同但从不显示，
+        // 其 preferredContentSize 始终反映内容自然高度
+        measuringController = NSHostingController(rootView: BubbleView(
+            model: model,
+            onCopyReply: { _ in },
+            onClose: { }
+        ))
+        // preferredContentSize 随 SwiftUI 内容自然高度更新（self-sizing 通道）
+        measuringController.sizingOptions = [.intrinsicContentSize, .preferredContentSize]
+
         // 先把窗口内容尺寸定下来再装内容视图：
         // 若在零尺寸窗口上装 contentView，子视图 autoresizing 会按负边距计算，
         // 窗口变成目标尺寸后 hosting view 会被拉伸到两倍大，布局全错。
-        panel.setContentSize(BubbleMetrics.size)
-
-        let host = NSHostingView(rootView: BubbleView(
-            model: model,
-            onCopyReply: { [weak self] reply in self?.copyReply(reply) },
-            onClose: { [weak self] in self?.dismissNow() }
-        ))
+        panel.setContentSize(NSSize(width: BubbleMetrics.width, height: BubbleMetrics.minHeight))
+        // 注意：不能用 contentViewController 装载——NSWindow 会自动 adopt 其
+        // preferredContentSize 且按“顶部锚定”调整，把窗口 origin 不断下压出屏。
+        // 显示副本只作为普通 contentView，尺寸由离屏测量手动驱动。
+        hostController.sizingOptions = []
+        panel.contentView = hostController.view
 
         // 毛玻璃背景放在 AppKit 层：NSVisualEffectView + 圆角 maskImage。
         // 直接在 SwiftUI 里写 .background(.ultraThinMaterial, in: shape) 的话，
         // NSHostingView 会在圆角之外渲染出一圈矩形背景色。
+        // popover 材质不透明度高（系统浮层的标准材质），文字对比清晰；
+        // 之前用的 underWindowBackground 太透，背景复杂时文字发虚。
         let effect = NSVisualEffectView()
-        effect.material = .underWindowBackground
+        effect.material = .popover
         effect.blendingMode = .behindWindow
         effect.state = .active
-        effect.maskImage = Self.roundedMaskImage(
-            size: BubbleMetrics.size,
-            cornerRadius: BubbleMetrics.cornerRadius
-        )
-
-        // hosting view 用约束钉满四边，不依赖 autoresizing 的相对边距
-        effect.addSubview(host)
-        host.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            host.leadingAnchor.constraint(equalTo: effect.leadingAnchor),
-            host.trailingAnchor.constraint(equalTo: effect.trailingAnchor),
-            host.topAnchor.constraint(equalTo: effect.topAnchor),
-            host.bottomAnchor.constraint(equalTo: effect.bottomAnchor),
-        ])
+        effect.isEmphasized = true
+        effect.maskImage = Self.roundedMaskImage(cornerRadius: BubbleMetrics.cornerRadius)
+        effect.autoresizingMask = [.width, .height]
+        hostController.view.addSubview(effect, positioned: .below, relativeTo: nil)
 
         // 悬停跟踪：进入气泡暂停自动关闭，移开重新计时
-        host.addTrackingArea(NSTrackingArea(
+        hostController.view.addTrackingArea(NSTrackingArea(
             rect: .zero,
             options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
             owner: panel,
@@ -94,17 +109,42 @@ final class BubbleController {
             self?.handleHover(hovering)
         }
 
-        panel.contentView = effect
+        // 内容自然高度变化 → 节流后强制离屏测量并调整窗口。
+        // 离屏视图不在窗口层级不会自动布局：每次 model 变化后手动
+        // setNeedsLayout + layoutSubtreeIfNeeded，再读 preferredContentSize
+        modelSink = model.objectWillChange.sink { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.scheduleMeasure()
+            }
+        }
+    }
+
+    /// 节流合并流式期间的高频内容变化（150ms 后测量一次）。
+    private func scheduleMeasure() {
+        measureTask?.cancel()
+        measureTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard let self else { return }
+            let probe = measuringController.view
+            probe.needsLayout = true
+            probe.layoutSubtreeIfNeeded()
+            applyResize(contentHeight: measuringController.preferredContentSize.height)
+        }
     }
 
     /// 圆角遮罩：黑色区域 = 毛玻璃可见区域，圆角外完全透明。
-    private static func roundedMaskImage(size: NSSize, cornerRadius: CGFloat) -> NSImage {
+    /// capInsets 固定四角，窗口高度变化时中心拉伸、圆角不变形。
+    private static func roundedMaskImage(cornerRadius: CGFloat) -> NSImage {
+        let edge = cornerRadius * 2
+        let size = NSSize(width: edge + 2, height: edge + 2)
         let image = NSImage(size: size, flipped: false) { rect in
             NSColor.black.setFill()
-            NSBezierPath(roundedRect: rect, xRadius: cornerRadius, yRadius: cornerRadius).fill()
+            NSBezierPath(roundedRect: rect.insetBy(dx: 1, dy: 1), xRadius: cornerRadius, yRadius: cornerRadius).fill()
             return true
         }
         image.isTemplate = true
+        image.capInsets = NSEdgeInsets(top: cornerRadius, left: cornerRadius, bottom: cornerRadius, right: cornerRadius)
+        image.resizingMode = .stretch
         return image
     }
 
@@ -115,6 +155,7 @@ final class BubbleController {
     func present(copied text: String) {
         dismissTask?.cancel()
         replyTask?.cancel()
+        measureTask?.cancel() // 新事件内容从矮开始重新长高
 
         let agents = agentProvider()
 
@@ -186,6 +227,27 @@ final class BubbleController {
         logInfo("回复已复制回剪贴板（不会再次触发气泡）")
     }
 
+    /// 执行深度模型推荐的操作。
+    private func performAction(_ action: RecommendedAction) {
+        logInfo("执行推荐操作：\(action.label)（\(action.type)）")
+        switch action.type {
+        case "open_url":
+            if let url = URL(string: action.arg), url.scheme?.hasPrefix("http") == true {
+                NSWorkspace.shared.open(url)
+            } else {
+                logInfo("推荐操作 open_url 的参数无效：\(action.arg.prefix(60))")
+            }
+        case "search":
+            guard let encoded = action.arg.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+                  let url = URL(string: "https://www.bing.com/search?q=\(encoded)") else { return }
+            NSWorkspace.shared.open(url)
+        case "copy":
+            copyHandler(action.arg) // 写剪贴板前会抑制下一次触发
+        default:
+            logInfo("未知操作类型：\(action.type)")
+        }
+    }
+
     /// 可选 Agent 的包装：nil 直接返回 nil，供 async let 使用。
     private static func runOpt(
         _ agent: (any AgentService)?,
@@ -224,9 +286,24 @@ final class BubbleController {
             visible = NSRect(x: 0, y: 0, width: 1440, height: 900)
         }
         return NSPoint(
-            x: visible.maxX - BubbleMetrics.size.width - margin,
+            x: visible.maxX - BubbleMetrics.width - margin,
             y: visible.minY + margin
         )
+    }
+
+    // MARK: - 高度自适应
+
+    /// 把窗口高度设为内容自然高度（clamp 到 [min, 屏幕可用]），底边位置不动、向上顶开。
+    private func applyResize(contentHeight: CGFloat) {
+        let visible = (NSScreen.main ?? NSScreen.screens.first)?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let maxHeight = min(BubbleMetrics.maxHeight, visible.height - margin * 2)
+        let height = min(max(contentHeight, BubbleMetrics.minHeight), maxHeight)
+
+        var frame = panel.frame
+        guard abs(frame.height - height) > 0.5 else { return }
+        frame.size.height = height
+        panel.setFrame(frame, display: false)
     }
 
     // MARK: - 自动关闭
