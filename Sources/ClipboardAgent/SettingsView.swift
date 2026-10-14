@@ -79,15 +79,33 @@ struct SettingsView: View {
 
     // MARK: - 🧭 决策模型（Jev）
 
+    /// 判决服务商：两家同协议（state + questions）但 Key 不通用。
+    private var decisionProvider: Binding<String> {
+        Binding(
+            get: {
+                settings.config.decisionBaseURL.contains("typesafe.ai") ? "typesafe" : "jev"
+            },
+            set: { provider in
+                settings.config.decisionBaseURL = provider == "typesafe"
+                    ? "https://api.typesafe.ai/v1/systemone"
+                    : JevDecisionService.defaultEndpoint
+            }
+        )
+    }
+
     private var decisionSection: some View {
         Section {
             Toggle("启用决策模型（快速回复后先判决）", isOn: $settings.config.enableDecision)
-            SecureField("Jev API Key", text: $settings.config.decisionAPIKey, prompt: Text("thejevai.com 的 API Key"))
+            Picker("服务商", selection: decisionProvider) {
+                Text("thejevai.com").tag("jev")
+                Text("typesafe.ai").tag("typesafe")
+            }
+            SecureField("Jev API Key", text: $settings.config.decisionAPIKey, prompt: Text("所选服务商的 API Key"))
             TextField("决策模型", text: $settings.config.decisionModel, prompt: Text("respan/span-01-lite:free（免费）"))
         } header: {
             Text("🧭 决策模型（Jev）")
         } footer: {
-            Text("启用后：⚡快速回复 → 🧭 Jev 判决是否足够 → 需要时才触发 🧠 深度（省一次深度调用）。未填 Key 时用内置演示裁判（按文本复杂度规则）；判决失败自动降级为直接触发深度。模型可用 thejevai.com 的 12 个 decisions 模型（respan/span-01-lite:free、inception/mercury-decide:free 为免费档）。")
+            Text("启用后：⚡快速回复 → 🧭 判决是否足够 → 需要时才触发 🧠 深度（省一次深度调用）。两家服务商协议相同但 API Key 不通用、模型名写法不同：thejevai.com 用 OpenRouter 路由名（respan/span-01-lite:free 免费、typesafe/jev-1.13）；typesafe.ai 用 jev-latest / jev-1.13.0。未填 Key 时用内置演示裁判；判决失败自动降级为直接触发深度。")
         }
         .disabled(!settings.config.useLLM)
     }
