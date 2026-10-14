@@ -133,7 +133,7 @@ struct OpenAICompatibleAgent: AgentService {
         guard (200..<300).contains(http.statusCode) else {
             var body = ""
             for try await line in bytes.lines { body += line }
-            throw AgentError.http(status: http.statusCode, message: Self.errorMessage(from: Data(body.utf8)))
+            throw AgentError.http(status: http.statusCode, message: AgentError.extractMessage(from: Data(body.utf8)))
         }
 
         var turn = ChatTurn()
@@ -201,7 +201,7 @@ struct OpenAICompatibleAgent: AgentService {
 
         guard let http = response as? HTTPURLResponse else { throw AgentError.badResponse }
         guard (200..<300).contains(http.statusCode) else {
-            throw AgentError.http(status: http.statusCode, message: Self.errorMessage(from: data))
+            throw AgentError.http(status: http.statusCode, message: AgentError.extractMessage(from: data))
         }
 
         let decoded = try JSONDecoder().decode(ChatCompletionResponse.self, from: data)
@@ -273,12 +273,7 @@ struct OpenAICompatibleAgent: AgentService {
         return URL(string: base + "/chat/completions")
     }
 
-    private static func errorMessage(from data: Data) -> String {
-        if let body = try? JSONDecoder().decode(APIErrorBody.self, from: data), let message = body.error?.message {
-            return message
-        }
-        return String(data: data.prefix(200), encoding: .utf8) ?? ""
-    }
+
 
     /// 非 SSE 单行 JSON 的兜底解析：是完整 Chat Completions 响应则返回 content。
     private static func decodeFullResponse(_ line: String) -> String? {
@@ -357,12 +352,22 @@ private struct ToolCallDelta: Decodable {
     let function: Fn?
 }
 
-private struct APIErrorBody: Decodable {
-    struct Payload: Decodable { let message: String? }
-    let error: Payload?
-}
-
 enum AgentError: LocalizedError {
+    /// 从错误响应体提取人类可读信息。
+    /// 兼容两种格式：OpenAI 的 {"error":{"message":…}} 与 Jev 的 {"code":…,"message":…}
+    static func extractMessage(from data: Data) -> String {
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let nested = json["error"] as? [String: Any],
+               let message = nested["message"] as? String, !message.isEmpty {
+                return message
+            }
+            if let message = json["message"] as? String, !message.isEmpty {
+                return message
+            }
+        }
+        return String(data: data.prefix(200), encoding: .utf8) ?? ""
+    }
+
     case badBaseURL
     case badResponse
     case http(status: Int, message: String)
@@ -378,6 +383,7 @@ enum AgentError: LocalizedError {
             let hint: String
             switch status {
             case 401, 403: hint = "API Key 无效或无权限"
+            case 402: hint = "账户积分/余额不足"
             case 404: hint = "路径不存在，请检查接口地址是否包含 /v1"
             case 429: hint = "请求过于频繁或额度不足"
             default: hint = "服务端错误"

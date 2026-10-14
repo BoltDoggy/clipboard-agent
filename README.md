@@ -82,6 +82,10 @@ open build/ClipboardAgent.app
 - **🔍 网络搜索工具（ReAct）**：深度模型可按 ReAct 方式调用 `web_search` / `read_webpage` 工具（原生 function calling，最多 4 轮），气泡中显示 🔍/📄 步骤行，最终回复附来源链接
   - 搜索与阅读优先走**智谱 BigModel 工具 API**（`/paas/v4/web_search` + `/paas/v4/reader`，填其 API Key 即启用）；未填 Key 时回退 DuckDuckGo Lite + 直接抓取（免费，依赖网络环境）
   - DeepSeek 思考模式 + 工具的要求已处理：assistant 回传携带 `reasoning_content`，避免 400
+- **🧭 决策模型（Jev AI，thejevai.com）**：可选的级联裁判——⚡快速回复完成后先判决，`fast_suffices` 直接收尾（省一次深度调用）、`need_deep` 才触发 🧠 深度（串行编排；未启用时保持快速/深度并行）
+  - 接入 `/v1/systemone`（state + choice 判决题），气泡中显示 🧭 判决行与置信度
+  - 12 个 decisions 模型可选（`respan/span-01-lite:free`、`inception/mercury-decide:free` 免费档）；接口地址可改指向自建网关
+  - 未填 Key 时用内置演示裁判；判决失败自动降级为直接触发深度（fail-open）；快速模型失败时跳过判决直接用深度兜底
 - 配置即时生效，持久化在本机 UserDefaults；API Key 只会发送到你填写的接口地址；旧版单模型配置自动迁移为快速模型
 
 ## 接入真实 LLM

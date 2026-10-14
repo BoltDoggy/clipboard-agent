@@ -16,6 +16,7 @@ struct SettingsView: View {
         Form {
             modeSection
             fastSection
+            decisionSection
             thinkingSection
             toolsSection
             promptSection
@@ -23,7 +24,7 @@ struct SettingsView: View {
             noteSection
         }
         .formStyle(.grouped)
-        .frame(width: 560, height: 780)
+        .frame(width: 560, height: 900)
     }
 
     // MARK: - Agent 模式
@@ -72,6 +73,21 @@ struct SettingsView: View {
             Text("🧠 深度思考模型")
         } footer: {
             Text("与快速模型并行请求、完成后追加到气泡（可跨供应商）。思考强度映射 reasoning_effort（DeepSeek 无中档→高、OpenAI 无最高档→高）；思考过程会在气泡的 💭 灰色块中流式展示。")
+        }
+        .disabled(!settings.config.useLLM)
+    }
+
+    // MARK: - 🧭 决策模型（Jev）
+
+    private var decisionSection: some View {
+        Section {
+            Toggle("启用决策模型（快速回复后先判决）", isOn: $settings.config.enableDecision)
+            SecureField("Jev API Key", text: $settings.config.decisionAPIKey, prompt: Text("thejevai.com 的 API Key"))
+            TextField("决策模型", text: $settings.config.decisionModel, prompt: Text("respan/span-01-lite:free（免费）"))
+        } header: {
+            Text("🧭 决策模型（Jev）")
+        } footer: {
+            Text("启用后：⚡快速回复 → 🧭 Jev 判决是否足够 → 需要时才触发 🧠 深度（省一次深度调用）。未填 Key 时用内置演示裁判（按文本复杂度规则）；判决失败自动降级为直接触发深度。模型可用 thejevai.com 的 12 个 decisions 模型（respan/span-01-lite:free、inception/mercury-decide:free 为免费档）。")
         }
         .disabled(!settings.config.useLLM)
     }

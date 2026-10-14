@@ -24,12 +24,30 @@ final class BubbleModel: ObservableObject {
         case active(ReplyState)
     }
 
+    /// 🧭 裁判槽：快速回复完成后是否需要深度。
+    enum DecisionSlot: Equatable {
+        case off
+        case idle // 已启用裁判，等快速回复完成
+        case pending
+        case decided(CascadeDecision, confidence: Double?)
+        case failed(String)
+    }
+
     /// 一次复制事件的两个独立状态槽，各自演进、互不覆盖（两段都保留展示）。
     @Published var copiedText: String?
     @Published var fastName = "Clip Agent"
     @Published var deepName: String?
     @Published var fastSlot: ReplyState = .pending
     @Published var deepSlot: DeepSlot = .off
+    @Published var decisionSlot: DecisionSlot = .off
+
+    /// 裁决模式：判决 need_deep 后激活深度段。
+    func activateDeep(name: String) {
+        guard case .off = deepSlot else { return }
+        deepName = name
+        deepRawContent = ""
+        deepSlot = .active(.pending)
+    }
 
     /// 深度模型的意图分析与推荐操作（从 <<ACTIONS>> 块解析）。
     @Published var intentSummary: String?
@@ -44,6 +62,7 @@ final class BubbleModel: ObservableObject {
         copiedText = copied
         fastSlot = .pending
         deepSlot = deepName == nil ? .off : .active(.pending)
+        decisionSlot = .off
         deepRawContent = ""
         intentSummary = nil
         recommendedActions = []
@@ -53,6 +72,7 @@ final class BubbleModel: ObservableObject {
         copiedText = nil
         fastSlot = .pending
         deepSlot = .off
+        decisionSlot = .off
         deepRawContent = ""
         intentSummary = nil
         recommendedActions = []
@@ -225,6 +245,11 @@ struct BubbleView: View {
             }
 
             fastSection
+
+            if shouldShowDecisionRow {
+                decisionRow
+            }
+
             deepSection
 
             if model.intentSummary != nil || !model.recommendedActions.isEmpty {
@@ -296,6 +321,10 @@ struct BubbleView: View {
     }
 
     private var subtitle: String {
+        // 裁决进行中优先展示判决状态
+        if case .pending = model.decisionSlot { return "⚡ 已回复 · 🧭 判决中…" }
+        if case .decided(.fastSuffices, _) = model.decisionSlot { return "⚡🧭 已完成 · 无需深度" }
+
         switch model.fastSlot {
         case .pending:
             return "正在分析…"
@@ -331,6 +360,45 @@ struct BubbleView: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(.quaternary.opacity(0.6))
         )
+    }
+
+    // MARK: - 🧭 裁决行
+
+    private var shouldShowDecisionRow: Bool {
+        switch model.decisionSlot {
+        case .off, .idle:
+            return false
+        default:
+            return true
+        }
+    }
+
+    @ViewBuilder
+    private var decisionRow: some View {
+        switch model.decisionSlot {
+        case .off, .idle:
+            EmptyView()
+        case .pending:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text("🧭 判决中：评估是否需要深度分析…")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+            }
+        case .decided(let decision, let confidence):
+            let pct = confidence.map { String(format: "（置信度 %.2f）", $0) } ?? ""
+            Text(decision == .fastSuffices
+                ? "🧭 判定：快速回复足够\(pct)，已跳过深度"
+                : "🧭 判定：需要深度分析\(pct)")
+                .font(.system(size: 10.5))
+                .foregroundStyle(decision == .fastSuffices ? .secondary : Color(nsColor: .systemBlue))
+                .lineLimit(2)
+        case .failed(let message):
+            Text("🧭 判决失败：\(message)（已直接触发深度）")
+                .font(.system(size: 10.5))
+                .foregroundStyle(.orange)
+                .lineLimit(2)
+        }
     }
 
     // MARK: - ⚡ 快速响应段

@@ -39,9 +39,11 @@ enum AgentOutcome: Equatable {
     }
 }
 
-/// 一次复制事件的级联编排输入：快速模型必选，深度思考模型可选。
-struct AgentPair {
+/// 一次复制事件的级联编排输入：快速模型必选；裁判（决策模型）与深度模型可选。
+/// 有裁判时编排为 串行（快速 → 判决 → 按需深度），无裁判时 快速/深度并行。
+struct CascadeBundle {
     let fast: any AgentService
+    let decider: (any DecisionService)?
     let thinking: (any AgentService)?
 }
 

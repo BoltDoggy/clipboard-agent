@@ -77,12 +77,17 @@ struct ModelConfig: Codable, Equatable {
     var thinkingEffort: ThinkingEffort = .high
     var enableWebTools = false // 深度模型 ReAct 工具调用（网络搜索 + 网页阅读）
     var toolAPIKey = "" // 智谱 BigModel 工具 API Key；空则回退 DuckDuckGo 免费搜索
+    var enableDecision = false // 🧭 Jev 决策模型：快速回复后先判决，需要才触发深度
+    var decisionAPIKey = "" // Jev AI API Key（thejevai.com）
+    var decisionModel = "respan/span-01-lite:free" // Jev 决策模型，默认免费档
+    var decisionBaseURL = JevDecisionService.defaultEndpoint // 可指向自建 Jev 兼容网关
     var streamOutput = true // 流式输出：LLM 走 SSE，离线演示为打字机效果
     var systemPrompt = "你是剪贴板助手。用户会给你一段刚复制的文本，请用一至两句话给出简短、有用的回应（摘要、解释、翻译要点或提醒），不要赘述。"
 
     private enum CodingKeys: String, CodingKey {
         case useLLM, fast, thinking, enableThinking, thinkingEffort
         case enableWebTools, toolAPIKey, streamOutput, systemPrompt
+        case enableDecision, decisionAPIKey, decisionModel, decisionBaseURL
     }
 
     /// v1 单模型配置的字段名，仅用于解码迁移。
@@ -102,6 +107,10 @@ struct ModelConfig: Codable, Equatable {
         thinkingEffort = try c.decodeIfPresent(ThinkingEffort.self, forKey: .thinkingEffort) ?? defaults.thinkingEffort
         enableWebTools = try c.decodeIfPresent(Bool.self, forKey: .enableWebTools) ?? defaults.enableWebTools
         toolAPIKey = try c.decodeIfPresent(String.self, forKey: .toolAPIKey) ?? defaults.toolAPIKey
+        enableDecision = try c.decodeIfPresent(Bool.self, forKey: .enableDecision) ?? defaults.enableDecision
+        decisionAPIKey = try c.decodeIfPresent(String.self, forKey: .decisionAPIKey) ?? defaults.decisionAPIKey
+        decisionModel = try c.decodeIfPresent(String.self, forKey: .decisionModel) ?? defaults.decisionModel
+decisionBaseURL = try c.decodeIfPresent(String.self, forKey: .decisionBaseURL) ?? defaults.decisionBaseURL
         streamOutput = try c.decodeIfPresent(Bool.self, forKey: .streamOutput) ?? defaults.streamOutput
         systemPrompt = try c.decodeIfPresent(String.self, forKey: .systemPrompt) ?? defaults.systemPrompt
 
@@ -137,7 +146,18 @@ final class AppSettings: ObservableObject {
     /// 当前生效的级联组合：
     /// - LLM 模式：两端点各自实例化（深度超时 30s）；fast 配置不完整回退离线演示，thinking 配置不完整则不启用
     /// - 离线模式：快速识别 + 延迟更长的“深度分析”演示，同样受 enableThinking 控制
-    var currentAgents: AgentPair {
+    /// 当前生效的级联组合（快速模型 + 可选裁判 + 可选深度模型）。
+    var currentAgents: CascadeBundle {
+        let decider: (any DecisionService)?
+        if config.enableDecision {
+            let key = config.decisionAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            decider = key.isEmpty
+                ? SimulatedDecisionService() // 开了开关没填 Key：离线演示裁判
+                : JevDecisionService(apiKey: key, model: config.decisionModel, baseURL: config.decisionBaseURL)
+        } else {
+            decider = nil
+        }
+
         if config.useLLM {
             let fastAgent: any AgentService = config.fast.isConfigured
                 ? OpenAICompatibleAgent(endpoint: config.fast, systemPrompt: config.systemPrompt, role: .fast)
@@ -159,10 +179,11 @@ final class AppSettings: ObservableObject {
             } else {
                 thinkingAgent = nil
             }
-            return AgentPair(fast: fastAgent, thinking: thinkingAgent)
+            return CascadeBundle(fast: fastAgent, decider: decider, thinking: thinkingAgent)
         }
-        return AgentPair(
+        return CascadeBundle(
             fast: SimulatedAgent(),
+            decider: decider,
             thinking: config.enableThinking ? SimulatedDeepAgent() : nil
         )
     }

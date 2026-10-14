@@ -42,6 +42,12 @@ final class BubbleController {
     private var dismissTask: Task<Void, Never>?
     private var isHovering = false // 鼠标悬停在气泡上时暂停自动关闭
 
+    // 裁判熔断：判决连续失败（如 Jev 积分不足）达到阈值后，本会话内自动回退并行模式，
+    // 不再白白多一跳请求与报错；判决成功即复位。
+    private var decisionFailureStreak = 0
+    private var decisionCircuitOpen = false
+    private let decisionFailureLimit = 3
+
     // 高度自适应：离屏测量副本（不进窗口层级，preferredContentSize 不受显示视口影响，
     // 否则会随当前窗口尺寸“自锁”）；model 变化节流后测量并调整窗口
     private var hostController: NSHostingController<BubbleView>!
@@ -50,7 +56,9 @@ final class BubbleController {
     private var measureTask: Task<Void, Never>?
 
     /// 每次触发时取当前生效的级联组合（由 AppDelegate 注入，随配置切换）。
-    var agentProvider: () -> AgentPair = { AgentPair(fast: SimulatedAgent(), thinking: nil) }
+    var agentProvider: () -> CascadeBundle = {
+        CascadeBundle(fast: SimulatedAgent(), decider: nil, thinking: nil)
+    }
 
     /// “复制回复”的落地动作，由 AppDelegate 注入（写剪贴板前会抑制下一次触发）。
     var copyHandler: (String) -> Void = { _ in }
@@ -150,23 +158,29 @@ final class BubbleController {
 
     // MARK: - 对外
 
-    /// 复制事件发生：弹出气泡，⚡快速模型先回、🧠深度模型并行思考完成后追加。
-    /// 两段各自写入独立状态槽（互不覆盖）；async let 使深度请求随父任务取消而取消。
+    /// 复制事件发生：⚡快速模型先回；有 🧭 裁判时先判决、需要才触发 🧠 深度（串行），
+    /// 无裁判时深度并行思考。两段各自写入独立状态槽（互不覆盖）。
     func present(copied text: String) {
         dismissTask?.cancel()
         replyTask?.cancel()
         measureTask?.cancel() // 新事件内容从矮开始重新长高
 
-        let agents = agentProvider()
+        var agents = agentProvider()
+        if decisionCircuitOpen, agents.decider != nil {
+            agents = CascadeBundle(fast: agents.fast, decider: nil, thinking: agents.thinking)
+        }
 
         // 超长文本只截断展示，分析仍用全文
         let displayText = text.count > 2000 ? String(text.prefix(2000)) + " …" : text
+        // 有裁判时深度段初始不出现，判决 need_deep 后再激活
+        let deepNameAtStart: String? = agents.decider == nil ? agents.thinking?.displayName : nil
         model.begin(
             copied: displayText,
             fastName: agents.fast.displayName,
-            deepName: agents.thinking?.displayName
+            deepName: deepNameAtStart
         )
-        logInfo("复制了 \(text.count) 字符，气泡已触发（快速：\(agents.fast.displayName)，深度：\(agents.thinking?.displayName ?? "未启用")）")
+        model.decisionSlot = agents.decider == nil ? .off : .idle
+        logInfo("复制了 \(text.count) 字符，气泡已触发（快速：\(agents.fast.displayName)，裁判：\(agents.decider != nil ? "启用" : "无")，深度：\(agents.thinking?.displayName ?? "未启用")）")
         showPanel()
 
         replyTask = Task { [weak self] in
@@ -180,37 +194,99 @@ final class BubbleController {
             let deepAppend = Self.streamAppender(streaming) { [weak self] event in
                 self?.model.appendDeep(event)
             }
-
-            // 深度请求先启动（后台并行），快速请求先行展示
+            let decider = agents.decider
             let deepAgent = agents.thinking
+
+            if let decider {
+                // ── 🧭 裁决模式：串行（快速 → 判决 → 按需深度）──
+                let fastOutcome = await runAgent(agents.fast, text, onDelta: fastAppend)
+                guard !Task.isCancelled else { return }
+                model.finishFast(fastOutcome)
+                logOutcome("快速回复", fastOutcome, name: agents.fast.displayName)
+
+                guard let deepAgent else {
+                    scheduleAutoDismiss()
+                    return
+                }
+                // 快速失败时不判决，直接用深度兜底
+                guard case .ok(let fastReply) = fastOutcome else {
+                    model.decisionSlot = .failed("快速模型出错，跳过判决")
+                    model.activateDeep(name: deepAgent.displayName)
+                    let outcome = await runAgent(deepAgent, text, onDelta: deepAppend)
+                    guard !Task.isCancelled else { return }
+                    model.finishDeep(outcome)
+                    logOutcome("深度思考", outcome, name: deepAgent.displayName)
+                    scheduleAutoDismiss()
+                    return
+                }
+
+                model.decisionSlot = .pending
+                do {
+                    let deepHasTools = AppSettings.shared.config.enableWebTools
+                    let verdict = try await decider.decide(copied: text, fastReply: fastReply, deepHasTools: deepHasTools)
+                    guard !Task.isCancelled else { return }
+                    decisionFailureStreak = 0 // 判决成功，复位熔断计数
+                    model.decisionSlot = .decided(verdict.decision, confidence: verdict.confidence)
+                    if verdict.decision == .fastSuffices {
+                        logInfo("🧭 判定：快速回复足够，跳过深度\(confidenceText(verdict.confidence))")
+                        scheduleAutoDismiss()
+                        return
+                    }
+                    logInfo("🧭 判定：需要深度分析\(confidenceText(verdict.confidence))")
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    // 决策失败不阻断：降级为直接触发深度（fail-open）；
+                    // 连续失败达到阈值则熔断，本会话后续直接走并行模式
+                    decisionFailureStreak += 1
+                    if decisionFailureStreak >= decisionFailureLimit && !decisionCircuitOpen {
+                        decisionCircuitOpen = true
+                        logInfo("🧭 判决连续失败 \(decisionFailureStreak) 次，已熔断：本会话后续跳过判决（重启应用或判决恢复后自动复位）")
+                    }
+                    model.decisionSlot = .failed(error.localizedDescription)
+                    logInfo("🧭 决策失败（\(error.localizedDescription)），降级为直接触发深度")
+                }
+                model.activateDeep(name: deepAgent.displayName)
+
+                let outcome = await runAgent(deepAgent, text, onDelta: deepAppend)
+                guard !Task.isCancelled else { return }
+                model.finishDeep(outcome)
+                logOutcome("深度思考", outcome, name: deepAgent.displayName)
+                scheduleAutoDismiss()
+                return
+            }
+
+            // ── 并行模式（无裁判）：深度请求先启动，快速先行展示 ──
             async let deepOutcome: AgentOutcome? = Self.runOpt(deepAgent, text, onDelta: deepAppend)
 
             let fastOutcome = await runAgent(agents.fast, text, onDelta: fastAppend)
             guard !Task.isCancelled else { return }
             model.finishFast(fastOutcome)
-            switch fastOutcome {
-            case .ok:
-                logInfo("快速回复完成（\(agents.fast.displayName)）")
-            case .failed:
-                logInfo("快速模型失败：\(fastOutcome.message ?? "")")
-            }
+            logOutcome("快速回复", fastOutcome, name: agents.fast.displayName)
+
             if deepAgent == nil {
                 scheduleAutoDismiss()
                 return
             }
-
             // 等深度思考收尾（快于快速模型时这里立即返回）
             if let outcome = await deepOutcome {
                 guard !Task.isCancelled else { return }
                 model.finishDeep(outcome)
-                switch outcome {
-                case .ok:
-                    logInfo("深度思考完成（\(deepAgent?.displayName ?? "")）")
-                case .failed:
-                    logInfo("深度思考失败：\(outcome.message ?? "")")
-                }
+                logOutcome("深度思考", outcome, name: deepAgent?.displayName ?? "")
             }
             scheduleAutoDismiss()
+        }
+    }
+
+    private func confidenceText(_ confidence: Double?) -> String {
+        confidence.map { String(format: "（置信度 %.2f）", $0) } ?? ""
+    }
+
+    private func logOutcome(_ label: String, _ outcome: AgentOutcome, name: String) {
+        switch outcome {
+        case .ok:
+            logInfo("\(label)完成（\(name)）")
+        case .failed:
+            logInfo("\(label)失败：\(outcome.message ?? "")")
         }
     }
 
