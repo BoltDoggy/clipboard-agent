@@ -290,6 +290,42 @@ final class BubbleController {
         }
     }
 
+    /// 文件复制事件：文件卡片 + 本地操作即时显示，深度模型读内容做意图分析（无快速/裁判环节）。
+    func present(files urls: [URL]) {
+        dismissTask?.cancel()
+        replyTask?.cancel()
+        measureTask?.cancel()
+
+        let files = urls.prefix(20).map(CopiedFile.init)
+        let agents = agentProvider()
+
+        model.beginFile(
+            copied: FileAnalyzer.previewTitle(files),
+            actions: FileAnalyzer.localActions(files)
+        )
+        logInfo("复制了 \(files.count) 个文件：\(FileAnalyzer.previewTitle(files))")
+        showPanel()
+
+        guard let deep = agents.thinking else {
+            logInfo("未启用深度模型，文件事件仅显示本地操作")
+            scheduleAutoDismiss()
+            return
+        }
+        replyTask = Task { [weak self] in
+            guard let self else { return }
+            let streaming = AppSettings.shared.config.streamOutput
+            let deepAppend = Self.streamAppender(streaming) { [weak self] event in
+                self?.model.appendDeep(event)
+            }
+            model.activateDeep(name: deep.displayName)
+            let outcome = await runAgent(deep, FileAnalyzer.deepInput(files), onDelta: deepAppend)
+            guard !Task.isCancelled else { return }
+            model.finishDeep(outcome)
+            logOutcome("文件意图分析", outcome, name: deep.displayName)
+            scheduleAutoDismiss()
+        }
+    }
+
     /// 立即关闭（关闭按钮 / 暂停监听时）。
     func dismissNow() {
         dismissTask?.cancel()
@@ -319,6 +355,12 @@ final class BubbleController {
             NSWorkspace.shared.open(url)
         case "copy":
             copyHandler(action.arg) // 写剪贴板前会抑制下一次触发
+        case "reveal":
+            // 在 Finder 中定位该文件
+            let directory = (action.arg as NSString).deletingLastPathComponent
+            NSWorkspace.shared.selectFile(action.arg, inFileViewerRootedAtPath: directory)
+        case "open":
+            NSWorkspace.shared.open(URL(fileURLWithPath: action.arg))
         default:
             logInfo("未知操作类型：\(action.type)")
         }

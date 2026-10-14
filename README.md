@@ -86,6 +86,7 @@ open build/ClipboardAgent.app
   - 接入 `/v1/systemone`（state + choice 判决题），气泡中显示 🧭 判决行与置信度
   - 12 个 decisions 模型可选（`respan/span-01-lite:free`、`inception/mercury-decide:free` 免费档）；接口地址可改指向自建网关
   - 未填 Key 时用内置演示裁判；判决失败自动降级为直接触发深度（fail-open）；快速模型失败时跳过判决直接用深度兜底
+- **📁 文件复制意图分析**：在 Finder ⌘C 文件（粘贴板的 fileURL 类型，与复制文件名是不同事件）触发专属气泡——文件卡片 + 零延迟本地操作（复制路径 / 复制文件名 / Finder 中显示 / 复制 Markdown 链接），深度模型读取文本类文件内容（白名单扩展名、≤200KB、截 4000 字）做意图分析与情境推荐；图片等二进制只按元信息分析；支持多文件（预览与逐文件分析）。文件事件不经过快速模型与裁判
 - 配置即时生效，持久化在本机 UserDefaults；API Key 只会发送到你填写的接口地址；旧版单模型配置自动迁移为快速模型
 
 ## 接入真实 LLM

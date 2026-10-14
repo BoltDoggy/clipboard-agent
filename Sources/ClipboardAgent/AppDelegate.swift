@@ -23,8 +23,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        monitor.onTextCopied = { [bubble] text in
-            bubble.present(copied: text)
+        monitor.onEvent = { [bubble] event in
+            switch event {
+            case .text(let text):
+                bubble.present(copied: text)
+            case .files(let urls):
+                bubble.present(files: urls)
+            }
         }
         monitor.start()
         setupStatusItem()

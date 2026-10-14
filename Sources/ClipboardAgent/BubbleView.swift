@@ -41,12 +41,29 @@ final class BubbleModel: ObservableObject {
     @Published var deepSlot: DeepSlot = .off
     @Published var decisionSlot: DecisionSlot = .off
 
+    /// 文件复制事件：无快速段，深度段做意图分析，本地操作先行展示。
+    @Published var isFileEvent = false
+
     /// 裁决模式：判决 need_deep 后激活深度段。
     func activateDeep(name: String) {
         guard case .off = deepSlot else { return }
         deepName = name
         deepRawContent = ""
         deepSlot = .active(.pending)
+    }
+
+    /// 文件事件初始化：预览标题 + 本地即时操作。
+    func beginFile(copied preview: String, actions: [RecommendedAction]) {
+        isFileEvent = true
+        copiedText = preview
+        fastName = "文件"
+        deepName = nil
+        fastSlot = .pending
+        deepSlot = .off
+        decisionSlot = .off
+        deepRawContent = ""
+        intentSummary = nil
+        recommendedActions = actions
     }
 
     /// 深度模型的意图分析与推荐操作（从 <<ACTIONS>> 块解析）。
@@ -59,6 +76,7 @@ final class BubbleModel: ObservableObject {
     func begin(copied: String, fastName: String, deepName: String?) {
         self.fastName = fastName
         self.deepName = deepName
+        isFileEvent = false
         copiedText = copied
         fastSlot = .pending
         deepSlot = deepName == nil ? .off : .active(.pending)
@@ -73,6 +91,7 @@ final class BubbleModel: ObservableObject {
         fastSlot = .pending
         deepSlot = .off
         decisionSlot = .off
+        isFileEvent = false
         deepRawContent = ""
         intentSummary = nil
         recommendedActions = []
@@ -244,13 +263,16 @@ struct BubbleView: View {
                 copiedBlock(copied)
             }
 
-            fastSection
-
-            if shouldShowDecisionRow {
-                decisionRow
+            if !model.isFileEvent {
+                fastSection
+                if shouldShowDecisionRow {
+                    decisionRow
+                }
+                deepSection
+            } else if case .active = model.deepSlot {
+                // 文件事件：无快速段，深度激活后显示分析段
+                deepSection
             }
-
-            deepSection
 
             if model.intentSummary != nil || !model.recommendedActions.isEmpty {
                 actionsBar
@@ -321,6 +343,18 @@ struct BubbleView: View {
     }
 
     private var subtitle: String {
+        // 文件事件：状态由深度分析段决定
+        if model.isFileEvent {
+            switch model.deepSlot {
+            case .off:
+                return model.recommendedActions.isEmpty ? "📄 文件已复制" : "📄 文件已复制 · 可用下方操作"
+            case .active(.pending), .active(.streaming):
+                return "📄 正在分析文件…"
+            case .active(.finished):
+                return "📄 分析完成 · 稍后自动关闭"
+            }
+        }
+
         // 裁决进行中优先展示判决状态
         if case .pending = model.decisionSlot { return "⚡ 已回复 · 🧭 判决中…" }
         if case .decided(.fastSuffices, _) = model.decisionSlot { return "⚡🧭 已完成 · 无需深度" }
@@ -552,16 +586,25 @@ struct BubbleView: View {
                     .lineLimit(2)
             }
             if !model.recommendedActions.isEmpty {
-                HStack(spacing: 8) {
-                    ForEach(Array(model.recommendedActions.enumerated()), id: \.offset) { _, action in
-                        Button {
-                            onAction(action)
-                        } label: {
-                            Label(action.label, systemImage: iconName(for: action.type))
-                                .font(.system(size: 11))
+                // 每 3 个一行，支持文件场景下“本地操作 + 模型推荐”共存的较多按钮
+                let actions = model.recommendedActions
+                let rows = stride(from: 0, to: actions.count, by: 3).map {
+                    Array(actions[$0..<min($0 + 3, actions.count)])
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                        HStack(spacing: 8) {
+                            ForEach(Array(row.enumerated()), id: \.offset) { _, action in
+                                Button {
+                                    onAction(action)
+                                } label: {
+                                    Label(action.label, systemImage: iconName(for: action.type))
+                                        .font(.system(size: 11))
+                                }
+                                .controlSize(.small)
+                                .buttonStyle(.bordered)
+                            }
                         }
-                        .controlSize(.small)
-                        .buttonStyle(.bordered)
                     }
                 }
             }
@@ -575,6 +618,8 @@ struct BubbleView: View {
         case "search": return "magnifyingglass"
         case "open_url": return "safari"
         case "copy": return "doc.on.doc"
+        case "reveal": return "folder"
+        case "open": return "arrow.up.forward.app"
         default: return "arrow.right.circle"
         }
     }
