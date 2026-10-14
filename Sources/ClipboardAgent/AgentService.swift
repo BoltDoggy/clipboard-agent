@@ -1,12 +1,17 @@
 import Foundation
 
-/// 流式事件的两种增量：思考过程 / 正式回复。
+/// 流式事件的增量类型：思考过程 / 工具步骤 / 正式回复。
 enum StreamEvent: Sendable, Equatable {
     case reasoning(String)
+    case step(String) // ReAct 工具动作（如 🔍 搜索 / 📄 读取），只作展示
     case content(String)
 
     var reasoningText: String {
         if case .reasoning(let s) = self { s } else { "" }
+    }
+
+    var stepText: String? {
+        if case .step(let s) = self { s } else { nil }
     }
 
     var contentText: String {

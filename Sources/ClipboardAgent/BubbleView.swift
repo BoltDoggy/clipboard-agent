@@ -2,17 +2,17 @@ import SwiftUI
 
 /// 气泡尺寸统一出处：NSPanel 与 SwiftUI 根视图共用。
 enum BubbleMetrics {
-    static let size = NSSize(width: 380, height: 420)
+    static let size = NSSize(width: 380, height: 480)
     static let cornerRadius: CGFloat = 18
 }
 
 @MainActor
 final class BubbleModel: ObservableObject {
-    /// 一个回复槽的生命周期：等待 → 流式（思考/正文双累积）→ 完成（思考过程保留展示）。
+    /// 一个回复槽的生命周期：等待 → 流式（思考/工具步骤/正文累积）→ 完成（思考与步骤保留展示）。
     enum ReplyState: Equatable {
         case pending
-        case streaming(reasoning: String, content: String)
-        case finished(AgentOutcome, reasoning: String)
+        case streaming(reasoning: String, steps: [String], content: String)
+        case finished(AgentOutcome, reasoning: String, steps: [String])
     }
 
     /// 深度槽多一个“未启用”态。
@@ -56,10 +56,15 @@ final class BubbleModel: ObservableObject {
     private static func appended(_ event: StreamEvent, to state: ReplyState) -> ReplyState {
         switch state {
         case .pending:
-            return .streaming(reasoning: event.reasoningText, content: event.contentText)
-        case .streaming(let reasoning, let content):
+            return .streaming(
+                reasoning: event.reasoningText,
+                steps: event.stepText.map { [$0] } ?? [],
+                content: event.contentText
+            )
+        case .streaming(let reasoning, let steps, let content):
             return .streaming(
                 reasoning: reasoning + event.reasoningText,
+                steps: event.stepText.map { steps + [$0] } ?? steps,
                 content: content + event.contentText
             )
         case .finished:
@@ -68,20 +73,29 @@ final class BubbleModel: ObservableObject {
     }
 
     func finishFast(_ outcome: AgentOutcome) {
-        fastSlot = .finished(outcome, reasoning: Self.reasoningOf(fastSlot))
+        fastSlot = .finished(outcome, reasoning: Self.reasoningOf(fastSlot), steps: Self.stepsOf(fastSlot))
     }
 
     func finishDeep(_ outcome: AgentOutcome) {
         guard case .active(let state) = deepSlot else { return }
-        deepSlot = .active(.finished(outcome, reasoning: Self.reasoningOf(state)))
+        deepSlot = .active(.finished(outcome, reasoning: Self.reasoningOf(state), steps: Self.stepsOf(state)))
     }
 
     private static func reasoningOf(_ state: ReplyState) -> String {
         switch state {
         case .pending, .finished:
             return ""
-        case .streaming(let reasoning, _):
+        case .streaming(let reasoning, _, _):
             return reasoning
+        }
+    }
+
+    private static func stepsOf(_ state: ReplyState) -> [String] {
+        switch state {
+        case .pending, .finished:
+            return []
+        case .streaming(_, let steps, _):
+            return steps
         }
     }
 }
@@ -250,21 +264,27 @@ struct BubbleView: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
             }
-        case .streaming(let reasoning, let content):
+        case .streaming(let reasoning, let steps, let content):
             VStack(alignment: .leading, spacing: 6) {
                 if !reasoning.isEmpty {
-                    reasoningBlock(reasoning, live: content.isEmpty, maxHeight: small ? 60 : 44)
+                    reasoningBlock(reasoning, live: content.isEmpty && steps.isEmpty, maxHeight: small ? 54 : 40)
+                }
+                if !steps.isEmpty {
+                    stepsBlock(steps)
                 }
                 if !content.isEmpty {
-                    StreamingText(text: content, fontSize: small ? 11.5 : 12, maxHeight: small ? 76 : 60)
+                    StreamingText(text: content, fontSize: small ? 11.5 : 12, maxHeight: small ? 74 : 60)
                 }
             }
-        case .finished(let outcome, let reasoning):
+        case .finished(let outcome, let reasoning, let steps):
             switch outcome {
             case .ok(let reply):
                 VStack(alignment: .leading, spacing: 6) {
                     if !reasoning.isEmpty {
-                        reasoningBlock(reasoning, live: false, maxHeight: small ? 60 : 44)
+                        reasoningBlock(reasoning, live: false, maxHeight: small ? 54 : 40)
+                    }
+                    if !steps.isEmpty {
+                        stepsBlock(steps)
                     }
                     ScrollView(.vertical) {
                         Text(reply)
@@ -273,7 +293,7 @@ struct BubbleView: View {
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(maxHeight: small ? 76 : 60)
+                    .frame(maxHeight: small ? 74 : 60)
                 }
             case .failed(let message):
                 Text(message)
@@ -282,6 +302,20 @@ struct BubbleView: View {
                     .lineLimit(small ? 2 : 3)
             }
         }
+    }
+
+    /// ReAct 工具步骤行（🔍 搜索 / 📄 读取），最多显示最近 4 条。
+    private func stepsBlock(_ steps: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(steps.suffix(4).enumerated()), id: \.offset) { _, step in
+                Text(step)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// 思考过程块：灰色小字斜体；live 时末尾带光标、自动滚底。
@@ -319,8 +353,8 @@ struct BubbleView: View {
 
     /// 当前展示的"主回复"：深度完成取深度，否则取快速（复制按钮的对象）。
     private var primaryReply: String? {
-        if case .active(.finished(.ok(let reply), _)) = model.deepSlot { return reply }
-        if case .finished(.ok(let reply), _) = model.fastSlot { return reply }
+        if case .active(.finished(.ok(let reply), _, _)) = model.deepSlot { return reply }
+        if case .finished(.ok(let reply), _, _) = model.fastSlot { return reply }
         return nil
     }
 

@@ -17,12 +17,13 @@ struct SettingsView: View {
             modeSection
             fastSection
             thinkingSection
+            toolsSection
             promptSection
             testSection
             noteSection
         }
         .formStyle(.grouped)
-        .frame(width: 560, height: 720)
+        .frame(width: 560, height: 780)
     }
 
     // MARK: - Agent 模式
@@ -73,6 +74,20 @@ struct SettingsView: View {
             Text("与快速模型并行请求、完成后追加到气泡（可跨供应商）。思考强度映射 reasoning_effort（DeepSeek 无中档→高、OpenAI 无最高档→高）；思考过程会在气泡的 💭 灰色块中流式展示。")
         }
         .disabled(!settings.config.useLLM)
+    }
+
+    // MARK: - 🔍 ReAct 工具
+
+    private var toolsSection: some View {
+        Section {
+            Toggle("启用网络搜索（ReAct 工具调用）", isOn: $settings.config.enableWebTools)
+            SecureField("智谱工具 API Key", text: $settings.config.toolAPIKey, prompt: Text("选填；不填则回退 DuckDuckGo 免费搜索"))
+        } header: {
+            Text("🔍 网络搜索工具")
+        } footer: {
+            Text("深度模型可按 ReAct 方式调用 web_search / read_webpage（气泡中显示 🔍/📄 步骤行）。搜索与阅读优先走智谱 BigModel 工具 API（open.bigmodel.cn，需其 API Key）；未填 Key 时回退 DuckDuckGo。")
+        }
+        .disabled(!settings.config.useLLM || !settings.config.enableThinking)
     }
 
     private func endpointFields(_ endpoint: Binding<EndpointConfig>) -> some View {

@@ -78,6 +78,9 @@ open build/ClipboardAgent.app
   - DeepSeek（V3.2+，`deepseek-flash`）**思考默认开启**——快速模型会被自动加上 `thinking:{"type":"disabled"}`，深度模型加 `enabled` + `reasoning_effort`；思考过程走 `reasoning_content`，在气泡的灰色「💭 思考过程」块中流式展示，正文随后流出
 - **系统提示词**：两个模型共用
 - **测试连接**：并行探测两个端点，⚡/🧠 各显示一行结果（延迟 + 回复预览 / 失败原因）
+- **🔍 网络搜索工具（ReAct）**：深度模型可按 ReAct 方式调用 `web_search` / `read_webpage` 工具（原生 function calling，最多 4 轮），气泡中显示 🔍/📄 步骤行，最终回复附来源链接
+  - 搜索与阅读优先走**智谱 BigModel 工具 API**（`/paas/v4/web_search` + `/paas/v4/reader`，填其 API Key 即启用）；未填 Key 时回退 DuckDuckGo Lite + 直接抓取（免费，依赖网络环境）
+  - DeepSeek 思考模式 + 工具的要求已处理：assistant 回传携带 `reasoning_content`，避免 400
 - 配置即时生效，持久化在本机 UserDefaults；API Key 只会发送到你填写的接口地址；旧版单模型配置自动迁移为快速模型
 
 ## 接入真实 LLM

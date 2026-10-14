@@ -1,5 +1,22 @@
 import Foundation
 
+/// 一次模型请求中的工具调用（function calling）。
+struct ToolCall: Equatable {
+    let id: String
+    let name: String
+    let arguments: String // JSON 字符串
+}
+
+/// 一轮对话（单次请求）的完整产物，供工具循环复用。
+struct ChatTurn {
+    var content = ""
+    var reasoning = ""
+    var toolCalls: [ToolCall] = []
+    var finishReason: String?
+
+    var hasToolCalls: Bool { !toolCalls.isEmpty }
+}
+
 /// OpenAI Chat Completions 协议兼容的 Agent。
 /// OpenAI、DeepSeek、GLM、通义、Moonshot、Ollama 等均可直连。
 struct OpenAICompatibleAgent: AgentService {
@@ -10,9 +27,9 @@ struct OpenAICompatibleAgent: AgentService {
     }
 
     let displayName: String
+    let systemPrompt: String // internal：ToolLoopAgent 会追加工具使用指引
 
     private let endpoint: EndpointConfig
-    private let systemPrompt: String
     private let role: Role
     private let effort: ThinkingEffort
     private let timeout: TimeInterval
@@ -33,11 +50,32 @@ struct OpenAICompatibleAgent: AgentService {
         self.displayName = name.isEmpty ? "LLM Agent" : name
     }
 
+    // MARK: - AgentService（单轮便捷封装）
+
     func respond(to text: String, onDelta: (@Sendable (StreamEvent) -> Void)? = nil) async throws -> String {
-        if let onDelta {
-            return try await respondStreaming(text, onDelta: onDelta)
+        let messages: [[String: Any]] = [
+            ["role": "system", "content": systemPrompt],
+            ["role": "user", "content": text],
+        ]
+        let turn = try await chatTurn(messages: messages, tools: nil, stream: onDelta != nil, onEvent: onDelta)
+        return turn.content
+    }
+
+    // MARK: - 核心单轮调用（ReAct 工具循环的底层）
+
+    /// 发送一组消息（可带工具 schema），流式时增量通过 onEvent 回调，
+    /// 返回该轮完整产物（正文 / 思考过程 / 工具调用）。
+    func chatTurn(
+        messages: [[String: Any]],
+        tools: [[String: Any]]?,
+        stream: Bool,
+        onEvent: (@Sendable (StreamEvent) -> Void)?
+    ) async throws -> ChatTurn {
+        let request = try buildRequest(messages: messages, tools: tools, stream: stream)
+        if stream, let onEvent {
+            return try await streamTurn(request, onEvent: onEvent)
         }
-        return try await respondOnce(text)
+        return try await onceTurn(request)
     }
 
     // MARK: - 思考参数映射
@@ -85,8 +123,10 @@ struct OpenAICompatibleAgent: AgentService {
 
     // MARK: - 流式（SSE）
 
-    private func respondStreaming(_ text: String, onDelta: (@Sendable (StreamEvent) -> Void)) async throws -> String {
-        let request = try buildRequest(for: text, stream: true)
+    private func streamTurn(
+        _ request: URLRequest,
+        onEvent: @escaping @Sendable (StreamEvent) -> Void
+    ) async throws -> ChatTurn {
         let (bytes, response) = try await URLSession.shared.bytes(for: request)
 
         guard let http = response as? HTTPURLResponse else { throw AgentError.badResponse }
@@ -96,13 +136,16 @@ struct OpenAICompatibleAgent: AgentService {
             throw AgentError.http(status: http.statusCode, message: Self.errorMessage(from: Data(body.utf8)))
         }
 
-        var full = ""
+        var turn = ChatTurn()
+        var toolAcc: [Int: ToolCallAcc] = [:]
+
         for try await line in bytes.lines {
             guard line.hasPrefix("data:") else {
                 // 个别网关不支持 SSE，直接回了完整 JSON——按非流式兜底解析
                 if let content = Self.decodeFullResponse(line) {
-                    onDelta(.content(content))
-                    return content
+                    onEvent(.content(content))
+                    turn.content = content
+                    return turn
                 }
                 continue
             }
@@ -112,33 +155,48 @@ struct OpenAICompatibleAgent: AgentService {
                   let chunk = try? JSONDecoder().decode(StreamChunk.self, from: data),
                   let choice = chunk.choices.first else { continue }
 
-            // 思考过程增量（DeepSeek/GLM/Qwen 用 reasoning_content，OpenAI 用 reasoning）
-            if let reasoning = choice.delta.reasoning ?? choice.delta.reasoningContent, !reasoning.isEmpty {
-                onDelta(.reasoning(reasoning))
+            if let finish = choice.finishReason, !finish.isEmpty {
+                turn.finishReason = finish
             }
-            if let delta = choice.delta.content, !delta.isEmpty {
-                full += delta
-                onDelta(.content(delta))
+            guard let delta = choice.delta else { continue }
+
+            // 思考过程增量（DeepSeek/GLM/Qwen 用 reasoning_content，OpenAI 用 reasoning）
+            if let reasoning = delta.reasoning ?? delta.reasoningContent, !reasoning.isEmpty {
+                turn.reasoning += reasoning
+                onEvent(.reasoning(reasoning))
+            }
+            // 工具调用增量：按 index 累积拼装 id / name / arguments
+            for tc in delta.toolCalls ?? [] {
+                let idx = tc.index ?? 0
+                var acc = toolAcc[idx] ?? ToolCallAcc()
+                if let id = tc.id, !id.isEmpty { acc.id = id }
+                if let name = tc.function?.name, !name.isEmpty { acc.name = name }
+                if let args = tc.function?.arguments { acc.arguments += args }
+                toolAcc[idx] = acc
+            }
+            if let content = delta.content, !content.isEmpty {
+                turn.content += content
+                onEvent(.content(content))
             }
         }
 
-        let trimmed = full.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw AgentError.emptyResponse }
-        return trimmed
+        turn.toolCalls = toolAcc
+            .sorted(by: { $0.key < $1.key })
+            .compactMap { _, acc in
+                acc.name.isEmpty ? nil : ToolCall(id: acc.id, name: acc.name, arguments: acc.arguments)
+            }
+        return turn
     }
 
-    /// 非 SSE 单行 JSON 的兜底解析：是完整 Chat Completions 响应则返回 content。
-    private static func decodeFullResponse(_ line: String) -> String? {
-        guard let data = line.data(using: .utf8),
-              let decoded = try? JSONDecoder().decode(ChatCompletionResponse.self, from: data),
-              let content = decoded.choices.first?.message.content else { return nil }
-        return content
+    private struct ToolCallAcc {
+        var id = ""
+        var name = ""
+        var arguments = ""
     }
 
     // MARK: - 非流式
 
-    private func respondOnce(_ text: String) async throws -> String {
-        let request = try buildRequest(for: text, stream: false)
+    private func onceTurn(_ request: URLRequest) async throws -> ChatTurn {
         let (data, response) = try await URLSession.shared.data(for: request)
 
         guard let http = response as? HTTPURLResponse else { throw AgentError.badResponse }
@@ -147,14 +205,35 @@ struct OpenAICompatibleAgent: AgentService {
         }
 
         let decoded = try JSONDecoder().decode(ChatCompletionResponse.self, from: data)
-        guard let content = decoded.choices.first?.message.content,
-              !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw AgentError.emptyResponse
+        guard let message = decoded.choices.first?.message else { throw AgentError.emptyResponse }
+
+        var turn = ChatTurn()
+        turn.finishReason = decoded.choices.first?.finishReason
+        turn.content = message.content ?? ""
+        turn.reasoning = message.reasoningContent ?? ""
+        turn.toolCalls = (message.toolCalls ?? []).compactMap { tc in
+            guard let name = tc.function?.name, !name.isEmpty else { return nil }
+            return ToolCall(
+                id: tc.id ?? "",
+                name: name,
+                arguments: tc.function?.arguments ?? "{}"
+            )
         }
-        return content.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let trimmed = turn.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !turn.hasToolCalls {
+            guard !trimmed.isEmpty else { throw AgentError.emptyResponse }
+        }
+        return turn
     }
 
-    private func buildRequest(for text: String, stream: Bool) throws -> URLRequest {
+    // MARK: - 请求构造
+
+    private func buildRequest(
+        messages: [[String: Any]],
+        tools: [[String: Any]]?,
+        stream: Bool
+    ) throws -> URLRequest {
         guard let url = Self.endpoint(for: endpoint.baseURL) else { throw AgentError.badBaseURL }
 
         var request = URLRequest(url: url)
@@ -171,11 +250,11 @@ struct OpenAICompatibleAgent: AgentService {
 
         var body: [String: Any] = [
             "model": endpoint.model,
-            "messages": [
-                ["role": "system", "content": systemPrompt],
-                ["role": "user", "content": text],
-            ],
+            "messages": messages,
         ]
+        if let tools, !tools.isEmpty {
+            body["tools"] = tools
+        }
         applyThinkingControl(to: &body)
         if stream {
             body["stream"] = true
@@ -200,34 +279,82 @@ struct OpenAICompatibleAgent: AgentService {
         }
         return String(data: data.prefix(200), encoding: .utf8) ?? ""
     }
+
+    /// 非 SSE 单行 JSON 的兜底解析：是完整 Chat Completions 响应则返回 content。
+    private static func decodeFullResponse(_ line: String) -> String? {
+        guard let data = line.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode(ChatCompletionResponse.self, from: data),
+              let content = decoded.choices.first?.message.content else { return nil }
+        return content
+    }
 }
 
 // MARK: - 响应 / 错误模型
 
 private struct ChatCompletionResponse: Decodable {
     struct Choice: Decodable {
-        struct Message: Decodable { let content: String? }
+        struct Message: Decodable {
+            struct ToolCallSpec: Decodable {
+                let id: String?
+                struct Fn: Decodable {
+                    let name: String?
+                    let arguments: String?
+                }
+                let function: Fn?
+            }
+            let content: String?
+            let reasoningContent: String?
+            let toolCalls: [ToolCallSpec]?
+
+            enum CodingKeys: String, CodingKey {
+                case content, toolCalls = "tool_calls"
+                case reasoningContent = "reasoning_content"
+            }
+        }
         let message: Message
+        let finishReason: String?
+
+        enum CodingKeys: String, CodingKey {
+            case message
+            case finishReason = "finish_reason"
+        }
     }
     let choices: [Choice]
 }
 
-/// SSE 增量块：choices[0].delta.content / .reasoning_content / .reasoning
 private struct StreamChunk: Decodable {
     struct Choice: Decodable {
         struct Delta: Decodable {
             let content: String?
-            let reasoning: String? // OpenAI 风格
-            let reasoningContent: String? // DeepSeek/GLM/Qwen 风格（reasoning_content）
+            let reasoning: String?
+            let reasoningContent: String?
+            let toolCalls: [ToolCallDelta]?
 
             enum CodingKeys: String, CodingKey {
                 case content, reasoning
+                case toolCalls = "tool_calls"
                 case reasoningContent = "reasoning_content"
             }
         }
-        let delta: Delta
+        let delta: Delta?
+        let finishReason: String?
+
+        enum CodingKeys: String, CodingKey {
+            case delta
+            case finishReason = "finish_reason"
+        }
     }
     let choices: [Choice]
+}
+
+private struct ToolCallDelta: Decodable {
+    let index: Int?
+    let id: String?
+    struct Fn: Decodable {
+        let name: String?
+        let arguments: String?
+    }
+    let function: Fn?
 }
 
 private struct APIErrorBody: Decodable {

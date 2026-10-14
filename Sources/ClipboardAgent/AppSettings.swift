@@ -75,11 +75,14 @@ struct ModelConfig: Codable, Equatable {
     var thinking = EndpointConfig(model: "gpt-4o")
     var enableThinking = true // 离线演示模式同样生效
     var thinkingEffort: ThinkingEffort = .high
+    var enableWebTools = false // 深度模型 ReAct 工具调用（网络搜索 + 网页阅读）
+    var toolAPIKey = "" // 智谱 BigModel 工具 API Key；空则回退 DuckDuckGo 免费搜索
     var streamOutput = true // 流式输出：LLM 走 SSE，离线演示为打字机效果
     var systemPrompt = "你是剪贴板助手。用户会给你一段刚复制的文本，请用一至两句话给出简短、有用的回应（摘要、解释、翻译要点或提醒），不要赘述。"
 
     private enum CodingKeys: String, CodingKey {
-        case useLLM, fast, thinking, enableThinking, thinkingEffort, streamOutput, systemPrompt
+        case useLLM, fast, thinking, enableThinking, thinkingEffort
+        case enableWebTools, toolAPIKey, streamOutput, systemPrompt
     }
 
     /// v1 单模型配置的字段名，仅用于解码迁移。
@@ -97,6 +100,8 @@ struct ModelConfig: Codable, Equatable {
         useLLM = try c.decodeIfPresent(Bool.self, forKey: .useLLM) ?? defaults.useLLM
         enableThinking = try c.decodeIfPresent(Bool.self, forKey: .enableThinking) ?? defaults.enableThinking
         thinkingEffort = try c.decodeIfPresent(ThinkingEffort.self, forKey: .thinkingEffort) ?? defaults.thinkingEffort
+        enableWebTools = try c.decodeIfPresent(Bool.self, forKey: .enableWebTools) ?? defaults.enableWebTools
+        toolAPIKey = try c.decodeIfPresent(String.self, forKey: .toolAPIKey) ?? defaults.toolAPIKey
         streamOutput = try c.decodeIfPresent(Bool.self, forKey: .streamOutput) ?? defaults.streamOutput
         systemPrompt = try c.decodeIfPresent(String.self, forKey: .systemPrompt) ?? defaults.systemPrompt
 
@@ -137,15 +142,21 @@ final class AppSettings: ObservableObject {
             let fastAgent: any AgentService = config.fast.isConfigured
                 ? OpenAICompatibleAgent(endpoint: config.fast, systemPrompt: config.systemPrompt, role: .fast)
                 : SimulatedAgent()
-            let thinkingAgent: (any AgentService)? = (config.enableThinking && config.thinking.isConfigured)
-                ? OpenAICompatibleAgent(
+            let thinkingAgent: (any AgentService)?
+            if config.enableThinking && config.thinking.isConfigured {
+                let base = OpenAICompatibleAgent(
                     endpoint: config.thinking,
                     systemPrompt: config.systemPrompt,
                     role: .deep,
                     effort: config.thinkingEffort,
                     timeout: 30
                 )
-                : nil
+                thinkingAgent = config.enableWebTools
+                    ? ToolLoopAgent(base: base, glmKey: config.toolAPIKey)
+                    : base
+            } else {
+                thinkingAgent = nil
+            }
             return AgentPair(fast: fastAgent, thinking: thinkingAgent)
         }
         return AgentPair(
