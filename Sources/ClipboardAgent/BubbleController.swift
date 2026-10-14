@@ -25,7 +25,7 @@ final class BubblePanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
-/// 气泡的生命周期管理：显示 / 更新阶段（思考 → 回复）/ 自动关闭。
+/// 气泡的生命周期管理：显示 / 级联编排（⚡快速 → 🧠深度）/ 自动关闭。
 @MainActor
 final class BubbleController {
     private let model = BubbleModel()
@@ -33,20 +33,19 @@ final class BubbleController {
     private var replyTask: Task<Void, Never>?
     private var dismissTask: Task<Void, Never>?
 
-    /// 每次触发时取当前生效的 Agent（由 AppDelegate 注入，随配置切换）。
-    var agentProvider: () -> any AgentService = { SimulatedAgent() }
+    /// 每次触发时取当前生效的级联组合（由 AppDelegate 注入，随配置切换）。
+    var agentProvider: () -> AgentPair = { AgentPair(fast: SimulatedAgent(), thinking: nil) }
 
     /// “复制回复”的落地动作，由 AppDelegate 注入（写剪贴板前会抑制下一次触发）。
     var copyHandler: (String) -> Void = { _ in }
 
-    private let panelSize = NSSize(width: 380, height: 240)
     private let margin: CGFloat = 18
 
     init() {
         // 先把窗口内容尺寸定下来再装内容视图：
         // 若在零尺寸窗口上装 contentView，子视图 autoresizing 会按负边距计算，
         // 窗口变成目标尺寸后 hosting view 会被拉伸到两倍大，布局全错。
-        panel.setContentSize(panelSize)
+        panel.setContentSize(BubbleMetrics.size)
 
         let host = NSHostingView(rootView: BubbleView(
             model: model,
@@ -61,7 +60,10 @@ final class BubbleController {
         effect.material = .underWindowBackground
         effect.blendingMode = .behindWindow
         effect.state = .active
-        effect.maskImage = Self.roundedMaskImage(size: panelSize, cornerRadius: 18)
+        effect.maskImage = Self.roundedMaskImage(
+            size: BubbleMetrics.size,
+            cornerRadius: BubbleMetrics.cornerRadius
+        )
 
         // hosting view 用约束钉满四边，不依赖 autoresizing 的相对边距
         effect.addSubview(host)
@@ -89,35 +91,66 @@ final class BubbleController {
 
     // MARK: - 对外
 
-    /// 复制事件发生：弹出气泡，进入“思考”状态，完成后展示回复。
+    /// 复制事件发生：弹出气泡，⚡快速模型先回、🧠深度模型并行思考完成后追加。
+    /// 两段各自写入独立状态槽（互不覆盖）；async let 使深度请求随父任务取消而取消。
     func present(copied text: String) {
         dismissTask?.cancel()
         replyTask?.cancel()
 
-        let agent = agentProvider()
-        model.agentName = agent.displayName
+        let agents = agentProvider()
 
         // 超长文本只截断展示，分析仍用全文
         let displayText = text.count > 2000 ? String(text.prefix(2000)) + " …" : text
-        model.phase = .thinking(displayText)
-        logInfo("复制了 \(text.count) 字符，气泡已触发（Agent：\(agent.displayName)）")
+        model.begin(
+            copied: displayText,
+            fastName: agents.fast.displayName,
+            deepName: agents.thinking?.displayName
+        )
+        logInfo("复制了 \(text.count) 字符，气泡已触发（快速：\(agents.fast.displayName)，深度：\(agents.thinking?.displayName ?? "未启用")）")
         showPanel()
 
         replyTask = Task { [weak self] in
             guard let self else { return }
-            do {
-                let reply = try await agent.respond(to: text)
-                guard !Task.isCancelled else { return }
-                model.phase = .replied(copied: displayText, reply: reply)
-                logInfo("Agent 回复完成，8 秒后自动关闭")
-                scheduleAutoDismiss(after: 8)
-            } catch is CancellationError {
-                // 被更新的复制事件取消，忽略
-            } catch {
-                guard !Task.isCancelled else { return }
-                model.phase = .replied(copied: displayText, reply: "Agent 出错了：\(error.localizedDescription)")
-                scheduleAutoDismiss(after: 8)
+
+            // 流式开关：关闭时 Agent 收不到 onDelta，走一次性请求/响应
+            let streaming = AppSettings.shared.config.streamOutput
+            let fastAppend = Self.streamAppender(streaming) { [weak self] event in
+                self?.model.appendFast(event)
             }
+            let deepAppend = Self.streamAppender(streaming) { [weak self] event in
+                self?.model.appendDeep(event)
+            }
+
+            // 深度请求先启动（后台并行），快速请求先行展示
+            let deepAgent = agents.thinking
+            async let deepOutcome: AgentOutcome? = Self.runOpt(deepAgent, text, onDelta: deepAppend)
+
+            let fastOutcome = await runAgent(agents.fast, text, onDelta: fastAppend)
+            guard !Task.isCancelled else { return }
+            model.finishFast(fastOutcome)
+            switch fastOutcome {
+            case .ok:
+                logInfo("快速回复完成（\(agents.fast.displayName)）")
+            case .failed:
+                logInfo("快速模型失败：\(fastOutcome.message ?? "")")
+            }
+            if deepAgent == nil {
+                scheduleAutoDismiss(after: 8)
+                return
+            }
+
+            // 等深度思考收尾（快于快速模型时这里立即返回）
+            if let outcome = await deepOutcome {
+                guard !Task.isCancelled else { return }
+                model.finishDeep(outcome)
+                switch outcome {
+                case .ok:
+                    logInfo("深度思考完成（\(deepAgent?.displayName ?? "")）")
+                case .failed:
+                    logInfo("深度思考失败：\(outcome.message ?? "")")
+                }
+            }
+            scheduleAutoDismiss(after: 8)
         }
     }
 
@@ -132,6 +165,25 @@ final class BubbleController {
     private func copyReply(_ reply: String) {
         copyHandler(reply)
         logInfo("回复已复制回剪贴板（不会再次触发气泡）")
+    }
+
+    /// 可选 Agent 的包装：nil 直接返回 nil，供 async let 使用。
+    private static func runOpt(
+        _ agent: (any AgentService)?,
+        _ text: String,
+        onDelta: (@MainActor (StreamEvent) -> Void)? = nil
+    ) async -> AgentOutcome? {
+        guard let agent else { return nil }
+        return await runAgent(agent, text, onDelta: onDelta)
+    }
+
+    /// 流式开关开启时返回写入闭包，关闭时返回 nil（Agent 收到 nil 就不发流式请求）。
+    private static func streamAppender<T>(
+        _ streaming: Bool,
+        _ apply: @escaping (T) -> Void
+    ) -> (@MainActor (T) -> Void)? {
+        guard streaming else { return nil }
+        return { value in apply(value) }
     }
 
     // MARK: - 显示与定位
@@ -153,7 +205,7 @@ final class BubbleController {
             visible = NSRect(x: 0, y: 0, width: 1440, height: 900)
         }
         return NSPoint(
-            x: visible.maxX - panelSize.width - margin,
+            x: visible.maxX - BubbleMetrics.size.width - margin,
             y: visible.minY + margin
         )
     }
@@ -180,7 +232,7 @@ final class BubbleController {
             guard let self, panel.alphaValue < 0.05 else { return } // 淡出期间又有新复制则不关
             panel.orderOut(nil)
             panel.alphaValue = 1
-            model.phase = .idle
+            model.reset()
         }
     }
 }

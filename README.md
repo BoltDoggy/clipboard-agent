@@ -60,18 +60,25 @@ open build/ClipboardAgent.app
 - **快速连续复制**：旧分析任务被取消，气泡直接切换到新内容
 - **超长文本**：展示截断到 2000 字符，分析仍用全文
 
-## 模型配置
+## 模型配置（双模型级联）
+
+复制文字后的处理流程：**⚡ 快速响应模型**先给出第一版回复，**🧠 深度思考模型**同时并行请求，完成后把深度分析追加到气泡下方（两段都保留，可对照）。回复**流式逐字显示**（LLM 走 SSE，离线演示为打字机效果），流式文本末尾带光标并自动滚动到底部。深度请求超时 30 秒，失败时气泡保留快速回复并标注原因。
 
 菜单栏 💬 → **模型配置…**（⌘,，或启动时加 `--settings` 参数）：
 
-- **Agent 模式**：离线演示 Agent（默认，无需配置）/ OpenAI 兼容 API（真实模型）
-- **模型配置**：接口地址、API Key、模型名称
+- **Agent 模式**：离线演示（默认，同样演示双阶段级联 + 打字机效果）/ OpenAI 兼容 API（真实模型）
+- **流式输出**：默认开启，SSE 逐字渲染；个别网关不支持流式时可在设置里关闭（关闭后走普通一次性请求，服务端若对 `stream:true` 仍返回完整 JSON 也会自动兜底解析）
+- **⚡ 快速响应模型** / **🧠 深度思考模型**：**各自独立的接口地址、API Key、模型名称**——可以跨供应商级联（如快速用 GLM-4-Flash、深度用 DeepSeek-R1）
   - 兼容 OpenAI Chat Completions 协议：OpenAI、DeepSeek、GLM、通义、Moonshot、Ollama 等
-  - 接口地址填到 `/v1` 即可（如 `https://api.openai.com/v1`；Ollama 填 `http://localhost:11434/v1`，Key 可留空；也接受完整 `/chat/completions` 路径）
-- **系统提示词**：定义 Agent 对每次复制文本的处理方式（摘要 / 翻译 / 解释……）
-- **测试连接**：发送一条最小请求，验证地址、密钥与模型名
-- 配置修改即时生效，气泡标题会显示当前使用的模型名；LLM 配置不完整时自动回退到离线演示
-- 配置保存在本机 UserDefaults，API Key 只会发送到你填写的接口地址
+  - 接口地址填到 `/v1` 即可（Ollama 填 `http://localhost:11434/v1`，Key 可留空）
+  - 「启用深度思考模型」开关关闭后只走快速模型
+- **思考控制**：快速模型固定禁用思考；深度模型可设**思考强度**（低/中/高/最高）
+  - 「思考参数」按端点选择协议风格：自动（按接口地址判断）/ `reasoning_effort` / `thinking.type`（GLM）/ `thinking.type + reasoning_effort`（DeepSeek）/ `enable_thinking`（Qwen）/ 不发送
+  - 强度按供应商自动折算：DeepSeek 无"中"档（→高）、OpenAI 无"最高"档（→高）
+  - DeepSeek（V3.2+，`deepseek-flash`）**思考默认开启**——快速模型会被自动加上 `thinking:{"type":"disabled"}`，深度模型加 `enabled` + `reasoning_effort`；思考过程走 `reasoning_content`，在气泡的灰色「💭 思考过程」块中流式展示，正文随后流出
+- **系统提示词**：两个模型共用
+- **测试连接**：并行探测两个端点，⚡/🧠 各显示一行结果（延迟 + 回复预览 / 失败原因）
+- 配置即时生效，持久化在本机 UserDefaults；API Key 只会发送到你填写的接口地址；旧版单模型配置自动迁移为快速模型
 
 ## 接入真实 LLM
 
@@ -102,4 +109,4 @@ API Key 建议从环境变量或 Keychain 读取，不要写进代码。
 ## 已知注意点
 
 - 入口文件里那个注释是踩过坑的：**不要**用 `await MainActor.run { app.run() }` 引导——那会让并发运行时认为主线程被一个永不结束的 MainActor 任务占用，之后所有 MainActor 任务和主队列 dispatch 都不再执行（气泡会永远停在“正在分析…”）。
-- 最低支持 macOS 13（Ventura）。
+- 最低支持 macOS 14（Sonoma）。

@@ -11,7 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         super.init()
 
         // 每次复制时按当前配置取 Agent：LLM 配置不完整时自动回退到离线演示
-        bubble.agentProvider = { AppSettings.shared.currentAgent }
+        bubble.agentProvider = { AppSettings.shared.currentAgents }
 
         // “复制回复”写回剪贴板前，先抑制下一次监听触发，避免自己弹自己。
         bubble.copyHandler = { [monitor] reply in
@@ -28,7 +28,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         monitor.start()
         setupStatusItem()
-        logInfo("当前 Agent：\(AppSettings.shared.currentAgent.displayName)")
+        logInfo("当前 Agent：⚡\(AppSettings.shared.currentAgents.fast.displayName)" +
+                (AppSettings.shared.currentAgents.thinking.map { " + 🧠\($0.displayName)" } ?? "（深度思考未启用）"))
         if CommandLine.arguments.contains("--settings") {
             SettingsWindowController.shared.show()
         }

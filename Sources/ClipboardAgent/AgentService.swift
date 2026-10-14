@@ -1,20 +1,102 @@
 import Foundation
 
+/// 流式事件的两种增量：思考过程 / 正式回复。
+enum StreamEvent: Sendable, Equatable {
+    case reasoning(String)
+    case content(String)
+
+    var reasoningText: String {
+        if case .reasoning(let s) = self { s } else { "" }
+    }
+
+    var contentText: String {
+        if case .content(let s) = self { s } else { "" }
+    }
+}
+
 /// 气泡里展示的“Agent”。实现这个协议即可接入真实模型（LLM API、本地脚本……）。
+/// `onDelta` 非 nil 时实现方应尽量流式输出（SSE / 打字机），否则一次性返回。
 protocol AgentService: Sendable {
     var displayName: String { get }
     /// 针对复制内容生成回复。调用方已在后台执行，可以做网络请求。
-    func respond(to text: String) async throws -> String
+    /// 增量片段（思考过程与正式回复）通过 onDelta 回调（任意线程），返回值为完整回复。
+    func respond(to text: String, onDelta: (@Sendable (StreamEvent) -> Void)?) async throws -> String
+}
+
+/// 一次 Agent 调用的结果（成功回复 / 失败原因），气泡状态槽直接消费。
+enum AgentOutcome: Equatable {
+    case ok(String)
+    case failed(String)
+
+    var message: String? {
+        if case .failed(let m) = self { return m }
+        return nil
+    }
+}
+
+/// 一次复制事件的级联编排输入：快速模型必选，深度思考模型可选。
+struct AgentPair {
+    let fast: any AgentService
+    let thinking: (any AgentService)?
+}
+
+/// 统一跑一次 Agent 并把结果/异常折叠成 AgentOutcome；
+/// onDelta 在 MainActor 上回调，方便直接写入气泡状态槽。
+@MainActor
+func runAgent(
+    _ agent: any AgentService,
+    _ text: String,
+    onDelta: (@MainActor (StreamEvent) -> Void)? = nil
+) async -> AgentOutcome {
+    // 网络层在后台线程回调，这里桥回主线程（Task 入队保持顺序）
+    var sendableDelta: (@Sendable (StreamEvent) -> Void)?
+    if let callback = onDelta {
+        sendableDelta = { event in Task { @MainActor in callback(event) } }
+    }
+    do {
+        return .ok(try await agent.respond(to: text, onDelta: sendableDelta))
+    } catch is CancellationError {
+        return .failed("已取消")
+    } catch {
+        return .failed(error.localizedDescription)
+    }
+}
+
+/// 把一段文本切成小块，供离线演示的打字机效果使用。
+private func typingChunks(_ text: String, size: Int = 3) -> [String] {
+    var chunks: [String] = []
+    var current = ""
+    for grapheme in text {
+        current.append(grapheme)
+        if current.count >= size {
+            chunks.append(current)
+            current = ""
+        }
+    }
+    if !current.isEmpty { chunks.append(current) }
+    return chunks
 }
 
 /// 离线演示 Agent：识别文本类型（链接 / JSON / 提问 / 长文），给一段模拟回复。
+/// 在级联里扮演“快速响应模型”（禁用思考，只有正式回复），带打字机效果。
 struct SimulatedAgent: AgentService {
     let displayName = "Clip Agent"
 
-    func respond(to text: String) async throws -> String {
-        // 模拟网络与推理延迟
-        try await Task.sleep(nanoseconds: UInt64.random(in: 600_000_000...1_400_000_000))
-        return Self.analyze(text)
+    func respond(to text: String, onDelta: (@Sendable (StreamEvent) -> Void)? = nil) async throws -> String {
+        try await Task.sleep(nanoseconds: UInt64.random(in: 300_000_000...800_000_000))
+        let reply = Self.analyze(text)
+        try await Self.typeOut(reply, onDelta: onDelta)
+        return reply
+    }
+
+    /// 按 onDelta 是否存在决定打字机或直接返回。
+    static func typeOut(_ reply: String, onDelta: (@Sendable (StreamEvent) -> Void)?) async throws {
+        guard let onDelta else { return }
+        for chunk in typingChunks(reply) {
+            try Task.checkCancellation()
+            onDelta(.content(chunk))
+            try await Task.sleep(nanoseconds: 40_000_000)
+        }
     }
 
     static func analyze(_ text: String) -> String {
@@ -45,5 +127,43 @@ struct SimulatedAgent: AgentService {
         }
 
         return "收到 \(chars) 个字符（\(words) 词）：「\(preview)」。这是演示 Agent 的模拟回复——把它换成真实 LLM 调用即可获得智能回复。"
+    }
+}
+
+/// 离线演示的“深度思考模型”：先流出思考过程，再流出正式回复，演示级联第二阶段。
+struct SimulatedDeepAgent: AgentService {
+    let displayName = "深度分析（演示）"
+
+    func respond(to text: String, onDelta: (@Sendable (StreamEvent) -> Void)? = nil) async throws -> String {
+        try await Task.sleep(nanoseconds: 600_000_000)
+
+        // 思考过程流（灰色块）
+        let reasoning = "先判断文本类型与语言，统计字符与句子数；再提取关键词、猜测复制意图；最后按「结论—要点—建议」组织回复。"
+        if let onDelta {
+            for chunk in typingChunks(reasoning) {
+                try Task.checkCancellation()
+                onDelta(.reasoning(chunk))
+                try await Task.sleep(nanoseconds: 35_000_000)
+            }
+        }
+
+        try await Task.sleep(nanoseconds: 250_000_000)
+        let reply = Self.analyzeDeep(text)
+        try await SimulatedAgent.typeOut(reply, onDelta: onDelta)
+        return reply
+    }
+
+    static func analyzeDeep(_ text: String) -> String {
+        let chars = text.count
+        let words = text.split(whereSeparator: \.isWhitespace).count
+        let hasCJK = text.unicodeScalars.contains(where: { $0.properties.isIdeographic })
+        let language = hasCJK ? "中文为主" : "西文为主"
+        let sentences = text.split(whereSeparator: { "。！？.!?\n".contains($0) }).count
+
+        return """
+        深度分析（演示）：这段文本共 \(chars) 字符 / \(words) 词 / 约 \(max(sentences, 1)) 句，\(language)。\
+        真实深度模型会在这里给出结构化结论：主题概括、要点提取、潜在风险或可执行建议。\
+        在「模型配置」中为快速/深度两个阶段分别填入 API 地址与模型名即可体验真实级联。
+        """
     }
 }

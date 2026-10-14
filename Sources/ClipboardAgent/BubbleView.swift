@@ -1,27 +1,89 @@
 import SwiftUI
 
+/// 气泡尺寸统一出处：NSPanel 与 SwiftUI 根视图共用。
+enum BubbleMetrics {
+    static let size = NSSize(width: 380, height: 420)
+    static let cornerRadius: CGFloat = 18
+}
+
 @MainActor
 final class BubbleModel: ObservableObject {
-    enum Phase {
-        case idle
-        case thinking(String)
-        case replied(copied: String, reply: String)
+    /// 一个回复槽的生命周期：等待 → 流式（思考/正文双累积）→ 完成（思考过程保留展示）。
+    enum ReplyState: Equatable {
+        case pending
+        case streaming(reasoning: String, content: String)
+        case finished(AgentOutcome, reasoning: String)
+    }
 
-        var copiedText: String? {
-            switch self {
-            case .idle: nil
-            case .thinking(let text), .replied(let text, _): text
-            }
-        }
+    /// 深度槽多一个“未启用”态。
+    enum DeepSlot: Equatable {
+        case off
+        case active(ReplyState)
+    }
 
-        var replyText: String? {
-            if case .replied(_, let reply) = self { reply } else { nil }
+    /// 一次复制事件的两个独立状态槽，各自演进、互不覆盖（两段都保留展示）。
+    @Published var copiedText: String?
+    @Published var fastName = "Clip Agent"
+    @Published var deepName: String?
+    @Published var fastSlot: ReplyState = .pending
+    @Published var deepSlot: DeepSlot = .off
+
+    func begin(copied: String, fastName: String, deepName: String?) {
+        self.fastName = fastName
+        self.deepName = deepName
+        copiedText = copied
+        fastSlot = .pending
+        deepSlot = deepName == nil ? .off : .active(.pending)
+    }
+
+    func reset() {
+        copiedText = nil
+        fastSlot = .pending
+        deepSlot = .off
+    }
+
+    // 流式增量写入（在 MainActor 上由 runAgent 的桥回调触发）
+
+    func appendFast(_ event: StreamEvent) {
+        fastSlot = Self.appended(event, to: fastSlot)
+    }
+
+    func appendDeep(_ event: StreamEvent) {
+        guard case .active(let state) = deepSlot else { return }
+        deepSlot = .active(Self.appended(event, to: state))
+    }
+
+    private static func appended(_ event: StreamEvent, to state: ReplyState) -> ReplyState {
+        switch state {
+        case .pending:
+            return .streaming(reasoning: event.reasoningText, content: event.contentText)
+        case .streaming(let reasoning, let content):
+            return .streaming(
+                reasoning: reasoning + event.reasoningText,
+                content: content + event.contentText
+            )
+        case .finished:
+            return state
         }
     }
 
-    /// 当前 Agent 的展示名（离线为 Clip Agent，LLM 为模型名）。
-    @Published var agentName = "Clip Agent"
-    @Published var phase: Phase = .idle
+    func finishFast(_ outcome: AgentOutcome) {
+        fastSlot = .finished(outcome, reasoning: Self.reasoningOf(fastSlot))
+    }
+
+    func finishDeep(_ outcome: AgentOutcome) {
+        guard case .active(let state) = deepSlot else { return }
+        deepSlot = .active(.finished(outcome, reasoning: Self.reasoningOf(state)))
+    }
+
+    private static func reasoningOf(_ state: ReplyState) -> String {
+        switch state {
+        case .pending, .finished:
+            return ""
+        case .streaming(let reasoning, _):
+            return reasoning
+        }
+    }
 }
 
 struct BubbleView: View {
@@ -32,22 +94,23 @@ struct BubbleView: View {
     @State private var appeared = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             header
 
-            if let copied = model.phase.copiedText {
+            if let copied = model.copiedText {
                 copiedBlock(copied)
             }
 
-            content
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            fastSection
+            deepSection
 
+            Spacer(minLength: 0)
             footer
         }
         .padding(16)
-        .frame(width: 380, height: 240)
+        .frame(width: BubbleMetrics.size.width, height: BubbleMetrics.size.height)
         .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
+            RoundedRectangle(cornerRadius: BubbleMetrics.cornerRadius, style: .continuous)
                 .strokeBorder(.white.opacity(0.15), lineWidth: 1)
         )
         // 毛玻璃背景和阴影由 AppKit 层提供（NSVisualEffectView + 圆角 maskImage + 窗口阴影），
@@ -78,7 +141,7 @@ struct BubbleView: View {
                 )
 
             VStack(alignment: .leading, spacing: 1) {
-                Text(model.agentName)
+                Text("ClipboardAgent")
                     .font(.system(size: 13, weight: .semibold))
                 Text(subtitle)
                     .font(.system(size: 10))
@@ -99,10 +162,20 @@ struct BubbleView: View {
     }
 
     private var subtitle: String {
-        switch model.phase {
-        case .idle: ""
-        case .thinking: "正在分析复制的文本…"
-        case .replied: "分析完成 · 稍后自动关闭"
+        switch model.fastSlot {
+        case .pending:
+            return "正在分析…"
+        case .streaming:
+            return model.deepSlot == .off ? "⚡ 回复中…" : "⚡ 回复中 · 🧠 思考中…"
+        case .finished:
+            switch model.deepSlot {
+            case .active(.pending), .active(.streaming):
+                return "⚡ 已回复 · 🧠 深度思考中…"
+            case .off:
+                return "已完成 · 稍后自动关闭"
+            case .active(.finished):
+                return "⚡🧠 均已完成 · 稍后自动关闭"
+            }
         }
     }
 
@@ -116,7 +189,7 @@ struct BubbleView: View {
             Text(copied)
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.secondary)
-                .lineLimit(3)
+                .lineLimit(2)
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -126,33 +199,130 @@ struct BubbleView: View {
         )
     }
 
-    // MARK: - Agent 回复区
+    // MARK: - ⚡ 快速响应段
+
+    private var fastSection: some View {
+        section(badge: "⚡", name: model.fastName) {
+            replyBody(model.fastSlot, small: false)
+        }
+    }
+
+    // MARK: - 🧠 深度思考段
 
     @ViewBuilder
-    private var content: some View {
-        switch model.phase {
-        case .idle:
-            EmptyView()
-        case .thinking:
-            HStack(spacing: 8) {
-                ProgressView()
-                    .controlSize(.small)
-                Text("\(model.agentName) 正在分析…")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-            }
-        case .replied(_, let reply):
-            ScrollView(.vertical) {
-                Text(reply)
-                    .font(.system(size: 12.5))
-                    .lineSpacing(3)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+    private var deepSection: some View {
+        if case .active(let state) = model.deepSlot {
+            section(badge: "🧠", name: model.deepName ?? "深度思考") {
+                replyBody(state, small: true)
             }
         }
     }
 
+    // MARK: - 复用组件
+
+    private func section<Content: View>(
+        badge: String,
+        name: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 4) {
+                Text(badge).font(.system(size: 10))
+                Text(name)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 0)
+            }
+            content()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func replyBody(_ state: BubbleModel.ReplyState, small: Bool) -> some View {
+        switch state {
+        case .pending:
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.mini)
+                Text(small ? "深度思考中…" : "\(model.fastName) 正在分析…")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+        case .streaming(let reasoning, let content):
+            VStack(alignment: .leading, spacing: 6) {
+                if !reasoning.isEmpty {
+                    reasoningBlock(reasoning, live: content.isEmpty, maxHeight: small ? 60 : 44)
+                }
+                if !content.isEmpty {
+                    StreamingText(text: content, fontSize: small ? 11.5 : 12, maxHeight: small ? 76 : 60)
+                }
+            }
+        case .finished(let outcome, let reasoning):
+            switch outcome {
+            case .ok(let reply):
+                VStack(alignment: .leading, spacing: 6) {
+                    if !reasoning.isEmpty {
+                        reasoningBlock(reasoning, live: false, maxHeight: small ? 60 : 44)
+                    }
+                    ScrollView(.vertical) {
+                        Text(reply)
+                            .font(.system(size: small ? 11.5 : 12))
+                            .lineSpacing(2.5)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: small ? 76 : 60)
+                }
+            case .failed(let message):
+                Text(message)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+                    .lineLimit(small ? 2 : 3)
+            }
+        }
+    }
+
+    /// 思考过程块：灰色小字斜体；live 时末尾带光标、自动滚底。
+    private func reasoningBlock(_ text: String, live: Bool, maxHeight: CGFloat) -> some View {
+        ScrollView(.vertical) {
+            ScrollViewReader { proxy in
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("💭 思考过程")
+                        .font(.system(size: 9.5))
+                        .foregroundStyle(.tertiary)
+                    Text(live ? text + "\u{258D}" : text)
+                        .font(.system(size: 10.5))
+                        .italic()
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .id("reasoning-bottom")
+                        .onChange(of: text) { _, _ in
+                            if live {
+                                proxy.scrollTo("reasoning-bottom", anchor: .bottom)
+                            }
+                        }
+                }
+            }
+        }
+        .frame(maxHeight: maxHeight)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(.quaternary.opacity(0.5))
+        )
+    }
+
     // MARK: - 底部操作
+
+    /// 当前展示的"主回复"：深度完成取深度，否则取快速（复制按钮的对象）。
+    private var primaryReply: String? {
+        if case .active(.finished(.ok(let reply), _)) = model.deepSlot { return reply }
+        if case .finished(.ok(let reply), _) = model.fastSlot { return reply }
+        return nil
+    }
 
     private var footer: some View {
         HStack(spacing: 8) {
@@ -161,12 +331,36 @@ struct BubbleView: View {
                 .foregroundStyle(.tertiary)
             Spacer(minLength: 8)
             Button("复制回复") {
-                if let reply = model.phase.replyText { onCopyReply(reply) }
+                if let reply = primaryReply { onCopyReply(reply) }
             }
             .controlSize(.small)
-            .disabled(model.phase.replyText == nil)
+            .disabled(primaryReply == nil)
             Button("关闭", action: onClose)
                 .controlSize(.small)
         }
+    }
+}
+
+/// 流式文本：末尾带光标，随内容增长自动滚到底部。
+private struct StreamingText: View {
+    let text: String
+    let fontSize: CGFloat
+    let maxHeight: CGFloat
+
+    var body: some View {
+        ScrollView(.vertical) {
+            ScrollViewReader { proxy in
+                Text(text + "\u{258D}")
+                    .font(.system(size: fontSize))
+                    .lineSpacing(2.5)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .id("stream-bottom")
+                    .onChange(of: text) { _, _ in
+                        proxy.scrollTo("stream-bottom", anchor: .bottom)
+                    }
+            }
+        }
+        .frame(maxHeight: maxHeight)
     }
 }
