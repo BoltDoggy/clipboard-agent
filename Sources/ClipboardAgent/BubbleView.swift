@@ -98,6 +98,28 @@ final class BubbleModel: ObservableObject {
             return steps
         }
     }
+
+    /// 两段回复的总字数，用于动态自动关闭时长（内容越多给越多阅读时间）。
+    var totalReplyLength: Int {
+        func contentLength(_ state: ReplyState) -> Int {
+            switch state {
+            case .pending:
+                return 0
+            case .streaming(_, _, let content):
+                return content.count
+            case .finished(let outcome, _, _):
+                if case .ok(let reply) = outcome { return reply.count }
+                return 0
+            }
+        }
+        let deep: Int
+        if case .active(let state) = deepSlot {
+            deep = contentLength(state)
+        } else {
+            deep = 0
+        }
+        return contentLength(fastSlot) + deep
+    }
 }
 
 struct BubbleView: View {
